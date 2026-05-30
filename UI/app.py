@@ -1,9 +1,12 @@
+import json
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
+
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 _FASTAPI_HOST = os.getenv("FASTAPI_HOST", "127.0.0.1")
 _FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "9005"))
@@ -13,8 +16,24 @@ FASTAPI_LOGIN_URL = f"{_FASTAPI_BASE_URL}/login"
 FASTAPI_EMAIL_PENDING_URL = f"{_FASTAPI_BASE_URL}/email-approval/pending"
 FASTAPI_EMAIL_APPROVE_URL = f"{_FASTAPI_BASE_URL}/email-approval/approve"
 
+SESSION_ID_LOCAL_STORAGE_KEY = "session_id"
+
+
+def _browser_persist_session_id(session_id: str | None) -> None:
+    """Write or clear session_id in the browser's localStorage (runs in component iframe)."""
+    key_js = json.dumps(SESSION_ID_LOCAL_STORAGE_KEY)
+    if session_id:
+        val_js = json.dumps(session_id)
+        script = f"localStorage.setItem({key_js}, {val_js});"
+    else:
+        script = f"localStorage.removeItem({key_js});"
+    components.html(f"<script>{script}</script>", height=0)
+
+
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
+if "session_id" not in st.session_state:
+    st.session_state.session_id = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "approval_requested" not in st.session_state:
@@ -50,7 +69,10 @@ def login():
         )
 
         if response.status_code == 200:
-            st.session_state.access_token = response.json().get("access_token")
+            data = response.json()
+            st.session_state.access_token = data.get("access_token")
+            st.session_state.session_id = data.get("session_id")
+            st.session_state._ls_session_id_synced = False
             st.session_state.messages = []
             st.session_state.approval_requested = False
             st.success("Logged in successfully!")
@@ -60,11 +82,18 @@ def login():
 
 
 def chat_interface():
+    if st.session_state.session_id and not st.session_state.get("_ls_session_id_synced"):
+        _browser_persist_session_id(st.session_state.session_id)
+        st.session_state._ls_session_id_synced = True
+
     st.title("Chat with AI")
     st.caption(f"Backend: `{FASTAPI_CHAT_URL}`")
 
     if st.button("Logout"):
+        _browser_persist_session_id(None)
         st.session_state.access_token = None
+        st.session_state.session_id = None
+        st.session_state._ls_session_id_synced = False
         st.session_state.messages = []
         st.session_state.approval_requested = False
         st.rerun()

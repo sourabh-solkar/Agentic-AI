@@ -1,10 +1,13 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
+
+from db.db_operations import append_chat_messages, combine_messages
 from langchain.agents import create_agent
 from typing import Annotated
 import os
 import time
+import uuid
 import asyncio
 import threading
 import uvicorn
@@ -20,7 +23,9 @@ from langchain.agents.middleware import PIIMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
 from langgraph.types import interrupt, Command
-
+from langchain.agents.middleware import SummarizationMiddleware
+import langchain
+# langchain.verbose = True
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -31,6 +36,11 @@ origins = [
     "http://localhost:3000/"
 ]
 
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    google_api_key=api_key,
+    streaming=False,
+)
 
 app = FastAPI();
 
@@ -95,16 +105,19 @@ pii_middleware = [
         PIIMiddleware("ip", strategy="mask", apply_to_input=True),
         PIIMiddleware("mac_address", strategy="redact", apply_to_input=True),
         PIIMiddleware("url", strategy="redact", apply_to_input=True),
+        SummarizationMiddleware(
+            model=llm,
+            trigger=("tokens", 600),
+            keep=("messages", 10),
+            summary_prompt=(
+                "You are a helpful assistant. Summarize the conversation history in a concise manner."
+            ),
+        ),
          # Layer 4: Model-based safety check (after agent)
         # SafetyGuardrailMiddleware(),
          # Persist the state across interrupts
     ]
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=api_key,
-    streaming=False,
-)
 
 _AGENT_SYSTEM_PROMPT = """You are a helpful assistant.
 
@@ -121,7 +134,6 @@ agent = create_agent(
     system_prompt=_AGENT_SYSTEM_PROMPT,
     middleware=pii_middleware,
     checkpointer=InMemorySaver(),
-
 )
 
 @app.get("/")
@@ -132,7 +144,7 @@ def read_root():
 
 class ChatRequest(BaseModel):
     message: str
-
+    session_id: str
 
 def _assistant_text(message: AIMessage) -> str:
     """Flatten assistant message content (Gemini may use str or block lists)."""
@@ -163,10 +175,10 @@ def _sse_data_lines(text: str) -> str:
     return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"
 
 
-async def event_generator(user_input: str):
+async def event_generator(user_input: str, combined_context: str, session_id: str):
     try:
         result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}]},
+            {"messages": [{"role": "user", "content": user_input}], "system": SystemMessage(content=combined_context)},
             config={"configurable": {"thread_id": _THREAD_ID}},
         )
         print("result ----->", result.get("__interrupt__"))
@@ -201,6 +213,11 @@ async def event_generator(user_input: str):
 
         if not assistant_text:
             assistant_text = "I could not generate a response."
+        try:
+            append_chat_messages(session_id, user_input, assistant_text)
+        except Exception as persist_err:
+            # Do not fail the stream if persistence fails; log for ops.
+            print("append_chat_messages failed:", persist_err)
         yield _sse_data_lines(assistant_text)
     except Exception as e:
         yield _sse_data_lines(f"[error] {e}")
@@ -235,11 +252,17 @@ async def chat(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
+        session_id = request.session_id 
+        if not session_id:
+            raise HTTPException(status_code=400, detail="`session_id` is required")
        
+        combined_context = combine_messages(session_id)
+
         return StreamingResponse(
-            event_generator(user_message),
+            event_generator(user_message, combined_context, session_id),
             media_type="text/event-stream",
             headers=headers,
+           
         )
     except HTTPException:
         raise
@@ -260,7 +283,8 @@ def login(req: LoginRequest):
             access_token = create_access_token(username=req.username, password=req.password)
             if not access_token:
                 raise HTTPException(status_code=500, detail="Failed to generate access token")
-            return {"access_token": access_token, "token_type": "bearer"}
+            session_id = str(uuid.uuid4())
+            return {"access_token": access_token, "token_type": "bearer" , "session_id": session_id}
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except HTTPException:
         raise
