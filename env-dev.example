@@ -1,0 +1,7 @@
+
+LANGSMITH_TRACING=true
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_PROJECT="<your-langsmith-project>"
+
+ANTHROPIC_API_KEY=<your-anthropic-api-key>

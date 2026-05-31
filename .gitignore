@@ -12,6 +12,7 @@ ENV/
 # Environment and secrets
 .env
 .env.*
+env-dev
 *.pem
 *.key
 
