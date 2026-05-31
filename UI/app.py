@@ -161,7 +161,10 @@ def chat_interface():
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        query = urllib.parse.urlencode({"message": prompt})
+        query = urllib.parse.urlencode({
+            "message": prompt,
+            "session_id": st.session_state.session_id or "",
+        })
         req_url = f"{FASTAPI_CHAT_URL}?{query}"
         request = urllib.request.Request(
             req_url,

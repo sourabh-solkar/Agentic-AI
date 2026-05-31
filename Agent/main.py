@@ -2,7 +2,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, SystemMessage
 
-from db.db_operations import append_chat_messages, combine_messages
+from db.db_operations import append_assistant_message, combine_messages, ensure_session, persist_chat_request
 from langchain.agents import create_agent
 from typing import Annotated
 import os
@@ -214,10 +214,9 @@ async def event_generator(user_input: str, combined_context: str, session_id: st
         if not assistant_text:
             assistant_text = "I could not generate a response."
         try:
-            append_chat_messages(session_id, user_input, assistant_text)
+            append_assistant_message(session_id, assistant_text)
         except Exception as persist_err:
-            # Do not fail the stream if persistence fails; log for ops.
-            print("append_chat_messages failed:", persist_err)
+            print("append_assistant_message failed:", persist_err)
         yield _sse_data_lines(assistant_text)
     except Exception as e:
         yield _sse_data_lines(f"[error] {e}")
@@ -233,6 +232,7 @@ async def event_generator(user_input: str, combined_context: str, session_id: st
 async def chat(
     token: Annotated[str, Depends(oauth2_scheme)],
     message: str | None = None,
+    session_id: str | None = None,
     request: ChatRequest | None = Body(default=None),
 ):
     try:
@@ -252,14 +252,18 @@ async def chat(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
-        session_id = request.session_id 
-        if not session_id:
+        resolved_session_id = session_id or (request.session_id if request else None)
+        if not resolved_session_id:
             raise HTTPException(status_code=400, detail="`session_id` is required")
-       
-        combined_context = combine_messages(session_id)
+
+        combined_context = combine_messages(resolved_session_id)
+        try:
+            persist_chat_request(resolved_session_id, user_message, combined_context)
+        except Exception as persist_err:
+            print("persist_chat_request failed:", persist_err)
 
         return StreamingResponse(
-            event_generator(user_message, combined_context, session_id),
+            event_generator(user_message, combined_context, resolved_session_id),
             media_type="text/event-stream",
             headers=headers,
            
@@ -284,6 +288,7 @@ def login(req: LoginRequest):
             if not access_token:
                 raise HTTPException(status_code=500, detail="Failed to generate access token")
             session_id = str(uuid.uuid4())
+            ensure_session(session_id)
             return {"access_token": access_token, "token_type": "bearer" , "session_id": session_id}
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except HTTPException:
