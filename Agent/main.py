@@ -2,7 +2,17 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, SystemMessage
 
-from db.db_operations import append_assistant_message, combine_messages, ensure_session, persist_chat_request
+from db.db_operations import (
+    append_assistant_message,
+    combine_messages,
+    create_session_for_user,
+    delete_session_for_user,
+    get_messages_for_session,
+    list_sessions_for_user,
+    persist_chat_request,
+    session_belongs_to_user,
+)
+from db.user_operations import create_user, get_user_by_username, verify_password
 from langchain.agents import create_agent
 from typing import Annotated
 import os
@@ -175,7 +185,24 @@ def _sse_data_lines(text: str) -> str:
     return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"
 
 
-async def event_generator(user_input: str, combined_context: str, session_id: str):
+def _verify_auth_payload(token: str) -> dict:
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    exp = payload.get("exp")
+    if exp and exp < time.time():
+        raise HTTPException(status_code=401, detail="Token expired")
+    if not payload.get("user_id"):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return payload
+
+
+async def event_generator(
+    user_input: str,
+    combined_context: str,
+    session_id: str,
+    user_id: str,
+):
     try:
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": user_input}], "system": SystemMessage(content=combined_context)},
@@ -214,7 +241,7 @@ async def event_generator(user_input: str, combined_context: str, session_id: st
         if not assistant_text:
             assistant_text = "I could not generate a response."
         try:
-            append_assistant_message(session_id, assistant_text)
+            append_assistant_message(session_id, assistant_text, user_id=user_id)
         except Exception as persist_err:
             print("append_assistant_message failed:", persist_err)
         yield _sse_data_lines(assistant_text)
@@ -236,12 +263,8 @@ async def chat(
     request: ChatRequest | None = Body(default=None),
 ):
     try:
-        payload = verify_token(token)
-        if not payload:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        exp = payload.get("exp")
-        if exp and exp < time.time():
-            raise HTTPException(status_code=401, detail="Token expired")
+        payload = _verify_auth_payload(token)
+        user_id = payload["user_id"]
 
         user_message = message or (request.message if request else None)
         if not user_message:
@@ -256,14 +279,22 @@ async def chat(
         if not resolved_session_id:
             raise HTTPException(status_code=400, detail="`session_id` is required")
 
+        if not session_belongs_to_user(resolved_session_id, user_id):
+            raise HTTPException(status_code=403, detail="Session not found")
+
         combined_context = combine_messages(resolved_session_id)
         try:
-            persist_chat_request(resolved_session_id, user_message, combined_context)
+            persist_chat_request(
+                resolved_session_id,
+                user_message,
+                combined_context,
+                user_id=user_id,
+            )
         except Exception as persist_err:
             print("persist_chat_request failed:", persist_err)
 
         return StreamingResponse(
-            event_generator(user_message, combined_context, resolved_session_id),
+            event_generator(user_message, combined_context, resolved_session_id, user_id),
             media_type="text/event-stream",
             headers=headers,
            
@@ -283,28 +314,96 @@ class LoginRequest(BaseModel):
 @app.post("/login")
 def login(req: LoginRequest):
     try:
-        if req.username == "admin" and req.password == "admin":
-            access_token = create_access_token(username=req.username, password=req.password)
-            if not access_token:
-                raise HTTPException(status_code=500, detail="Failed to generate access token")
-            session_id = str(uuid.uuid4())
-            ensure_session(session_id)
-            return {"access_token": access_token, "token_type": "bearer" , "session_id": session_id}
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        user = get_user_by_username(req.username)
+        if not user or not verify_password(req.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        access_token = create_access_token(
+            username=user["username"],
+            user_id=str(user["id"]),
+        )
+        if not access_token:
+            raise HTTPException(status_code=500, detail="Failed to generate access token")
+
+        session_id = str(uuid.uuid4())
+        create_session_for_user(str(user["id"]), session_id)
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "session_id": session_id,
+        }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/register")
+def register(req: LoginRequest):
+    try:
+        if get_user_by_username(req.username):
+            raise HTTPException(status_code=409, detail="Username already exists")
+        user = create_user(req.username, req.password)
+        access_token = create_access_token(
+            username=user["username"],
+            user_id=str(user["id"]),
+        )
+        if not access_token:
+            raise HTTPException(status_code=500, detail="Failed to generate access token")
+        session_id = str(uuid.uuid4())
+        create_session_for_user(str(user["id"]), session_id)
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "session_id": session_id,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions")
+def list_sessions(token: Annotated[str, Depends(oauth2_scheme)]):
+    payload = _verify_auth_payload(token)
+    sessions = list_sessions_for_user(payload["user_id"])
+    return {"sessions": sessions}
+
+
+@app.post("/sessions")
+def create_session(token: Annotated[str, Depends(oauth2_scheme)]):
+    payload = _verify_auth_payload(token)
+    session_id = str(uuid.uuid4())
+    create_session_for_user(payload["user_id"], session_id)
+    return {"session_id": session_id}
+
+
+@app.get("/sessions/{session_id}/messages")
+def get_session_messages(
+    session_id: str,
+    token: Annotated[str, Depends(oauth2_scheme)],
+):
+    payload = _verify_auth_payload(token)
+    if not session_belongs_to_user(session_id, payload["user_id"]):
+        raise HTTPException(status_code=404, detail="Session not found")
+    messages = get_messages_for_session(session_id)
+    return {"messages": messages}
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: str,
+    token: Annotated[str, Depends(oauth2_scheme)],
+):
+    payload = _verify_auth_payload(token)
+    if not delete_session_for_user(session_id, payload["user_id"]):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "deleted", "session_id": session_id}
+
+
 @app.get("/email-approval/pending")
 def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
-    payload = verify_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    exp = payload.get("exp")
-    if exp and exp < time.time():
-        raise HTTPException(status_code=401, detail="Token expired")
+    _verify_auth_payload(token)
 
     with _approval_lock:
         pending = _sanitize_approval_payload(_pending_email_approval)
@@ -313,12 +412,7 @@ def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
 
 @app.post("/email-approval/approve")
 def approve_pending_email(token: Annotated[str, Depends(oauth2_scheme)]):
-    payload = verify_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    exp = payload.get("exp")
-    if exp and exp < time.time():
-        raise HTTPException(status_code=401, detail="Token expired")
+    _verify_auth_payload(token)
 
     with _approval_lock:
         global _pending_email_approval

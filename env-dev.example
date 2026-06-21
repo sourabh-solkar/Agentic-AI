@@ -5,3 +5,23 @@ LANGSMITH_API_KEY=<your-langsmith-api-key>
 LANGSMITH_PROJECT="<your-langsmith-project>"
 
 ANTHROPIC_API_KEY=<your-anthropic-api-key>
+
+# Auth
+SECREAT_KEY=<your-jwt-secret>
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# PostgreSQL (optional — defaults shown)
+DATABASE_URL=postgresql://postgres:@localhost:5432/sessions
+# Or use individual vars:
+# DB_NAME=sessions
+# DB_USER=postgres
+# DB_PASSWORD=
+# DB_HOST=localhost
+# DB_PORT=5432
+
+# Default admin seeded by: python -m db.init_db (from Agent/)
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=admin
+
+GEMINI_API_KEY=<your-gemini-api-key>

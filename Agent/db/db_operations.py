@@ -18,12 +18,15 @@ chat_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_k
 
 
 def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        return psycopg.connect(db_url, row_factory=dict_row)
     return psycopg.connect(
-        dbname="sessions",
-        user="postgres",
-        password="",
-        host="localhost",
-        port="5432",
+        dbname=os.getenv("DB_NAME", "sessions"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", ""),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
         row_factory=dict_row,
     )
 
@@ -160,24 +163,117 @@ def get_old_messages(session_id: str, limit: int = 5) -> list[dict]:
             return list(cur.fetchall())
 
 
-def ensure_session(session_id: str) -> None:
+def ensure_session(session_id: str, user_id: str | None = None) -> None:
     """Create a sessions row if missing (required by messages FK)."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO sessions (session_id)
-                VALUES (%s)
+                INSERT INTO sessions (session_id, user_id)
+                VALUES (%s, %s)
                 ON CONFLICT (session_id) DO NOTHING
                 """,
-                (session_id,),
+                (session_id, user_id),
             )
         conn.commit()
 
 
-def persist_chat_request(session_id: str, user_content: str, summarized_context: str) -> None:
+def create_session_for_user(user_id: str, session_id: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO sessions (session_id, user_id)
+                VALUES (%s, %s)
+                ON CONFLICT (session_id) DO NOTHING;
+                """,
+                (session_id, user_id),
+            )
+        conn.commit()
+
+
+def session_belongs_to_user(session_id: str, user_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM sessions WHERE session_id = %s AND user_id = %s;",
+                (session_id, user_id),
+            )
+            return cur.fetchone() is not None
+
+
+def list_sessions_for_user(user_id: str) -> list[dict]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT session_id, title, created_at, updated_at
+                FROM sessions
+                WHERE user_id = %s
+                ORDER BY updated_at DESC;
+                """,
+                (user_id,),
+            )
+            return list(cur.fetchall())
+
+
+def get_messages_for_session(session_id: str) -> list[dict]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT role, content, created_at
+                FROM messages
+                WHERE session_id = %s AND role IN ('user', 'assistant')
+                ORDER BY created_at ASC;
+                """,
+                (session_id,),
+            )
+            return list(cur.fetchall())
+
+
+def delete_session_for_user(session_id: str, user_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM sessions WHERE session_id = %s AND user_id = %s;",
+                (session_id, user_id),
+            )
+            deleted = cur.rowcount > 0
+        conn.commit()
+    return deleted
+
+
+def touch_session(session_id: str, title: str | None = None) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if title:
+                cur.execute(
+                    """
+                    UPDATE sessions
+                    SET updated_at = CURRENT_TIMESTAMP, title = %s
+                    WHERE session_id = %s AND title = 'New chat';
+                    """,
+                    (title, session_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE session_id = %s;",
+                    (session_id,),
+                )
+        conn.commit()
+
+
+def persist_chat_request(
+    session_id: str,
+    user_content: str,
+    summarized_context: str,
+    user_id: str | None = None,
+) -> None:
     """Save the user message and summarized context before the agent responds."""
-    ensure_session(session_id)
+    ensure_session(session_id, user_id)
+    title = user_content[:50] + ("..." if len(user_content) > 50 else "")
+    touch_session(session_id, title=title)
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -191,9 +287,10 @@ def persist_chat_request(session_id: str, user_content: str, summarized_context:
         conn.commit()
 
 
-def append_assistant_message(session_id: str, assistant_content: str) -> None:
+def append_assistant_message(session_id: str, assistant_content: str, user_id: str | None = None) -> None:
     """Persist the assistant reply after the agent finishes."""
-    ensure_session(session_id)
+    ensure_session(session_id, user_id)
+    touch_session(session_id)
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
