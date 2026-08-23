@@ -1,6 +1,6 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 from db.db_operations import (
     append_assistant_message,
@@ -14,7 +14,7 @@ from db.db_operations import (
 )
 from db.user_operations import create_user, get_user_by_username, verify_password
 from langchain.agents import create_agent
-from typing import Annotated
+from typing import Annotated, Literal
 import os
 import time
 import uuid
@@ -32,7 +32,10 @@ from fastapi.security import OAuth2PasswordBearer
 from langchain.agents.middleware import PIIMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
+from langgraph.graph import END, MessagesState, START, StateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt, Command
+from utils.tools import booking_hotel, check_availability, get_hotel_policy, get_hotels
 from langchain.agents.middleware import SummarizationMiddleware
 import langchain
 # langchain.verbose = True
@@ -64,6 +67,84 @@ app.add_middleware(
 _approval_lock = threading.Lock()
 _pending_email_approval: dict[str, str] | None = None
 _THREAD_ID = "chat-session"
+
+
+TRIAGE_TOOLS = [get_hotels, check_availability]
+BOOKING_TOOLS = [booking_hotel]
+POLICY_TOOLS = [get_hotel_policy]
+SWARM_TOOLS = TRIAGE_TOOLS + BOOKING_TOOLS + POLICY_TOOLS
+
+_SWARM_ROUTE_MAP = {
+    "tools": "tools",
+    "triage": "triage",
+    "booking": "booking",
+    "policy": "policy",
+    END: END,
+}
+
+
+def _make_agent_node(system_prompt: str, tools: list):
+    model_with_tools = llm.bind_tools(tools)
+
+    def call_agent(state: MessagesState):
+        response = model_with_tools.invoke(
+            [SystemMessage(content=system_prompt), *state["messages"]]
+        )
+        return {"messages": [response]}
+
+    return call_agent
+
+
+triage_agent = _make_agent_node(
+    "You are a hotel triage assistant. Help users search hotels and check room availability. "
+    "Use get_hotels and check_availability when needed.",
+    TRIAGE_TOOLS,
+)
+booking_agent = _make_agent_node(
+    "You are a hotel booking assistant. Confirm details and use booking_hotel to complete reservations.",
+    BOOKING_TOOLS,
+)
+policy_agent = _make_agent_node(
+    "You are a hotel policy assistant. Answer questions about cancellation, refunds, and check-in rules "
+    "using get_hotel_policy.",
+    POLICY_TOOLS,
+)
+
+
+def swarm_router(
+    state: MessagesState,
+) -> Literal["tools", "triage", "booking", "policy", "__end__"]:
+    last_message = state["messages"][-1]
+
+    # If the LLM made a tool call, send it to the tool execution node
+    if last_message.tool_calls:
+        return "tools"
+
+    # If the last message came from a tool, decide which agent takes over based on the tool's name
+    if isinstance(last_message, ToolMessage):
+        if "booking" in (last_message.name or ""):
+            return "booking"
+        if "policy" in (last_message.name or ""):
+            return "policy"
+        return "triage"
+
+    # If no tools were called, return control back to the user
+    return END
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("triage", triage_agent)
+builder.add_node("booking", booking_agent)
+builder.add_node("policy", policy_agent)
+builder.add_node("tools", ToolNode(SWARM_TOOLS))
+
+builder.add_edge(START, "triage")
+
+for _node in ("triage", "booking", "policy", "tools"):
+    builder.add_conditional_edges(_node, swarm_router, _SWARM_ROUTE_MAP)
+
+swarm = builder.compile(checkpointer=InMemorySaver())
+
 
 
 def _email_request_id(to: str, subject: str, body: str) -> str:

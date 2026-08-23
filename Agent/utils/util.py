@@ -1,3 +1,4 @@
+
 # An async generator that pulls tokens from the agent
 async def event_generator(user_input: str):
     # .astream yields events as the agent processes the request
@@ -9,3 +10,8 @@ async def event_generator(user_input: str):
             
             # Format as Server-Sent Events (SSE) standard
             yield f"data: {token}\n\n"
+
+
+
+
+

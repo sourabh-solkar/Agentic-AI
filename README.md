@@ -57,3 +57,18 @@ To record exact versions for reproducible installs:
 ```powershell
 pip freeze > requirements.lock.txt
 ```
+
+**Export just that folder dependencies**:
+
+```powershell
+pipreqs . --force
+```
+
+**Build and Run Docker**:
+
+```
+cd "C:\Users\saura\OneDrive\Documents\Study\Agentic AI\Agent"
+docker build -t agent-api:v2 .
+docker stop happy_wing; docker rm happy_wing
+docker run -d --name happy_wing -p 9005:9005 --env-file "..\.env" -e DB_HOST=host.docker.internal agent-api:v2
+```
