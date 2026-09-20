@@ -1,6 +1,6 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage
 
 from db.db_operations import (
     append_assistant_message,
@@ -13,15 +13,16 @@ from db.db_operations import (
     session_belongs_to_user,
 )
 from db.user_operations import create_user, get_user_by_username, verify_password
+from db.db_operations import get_database_url
 from langchain.agents import create_agent
-from typing import Annotated, Literal
+from typing import Annotated, Any
+from contextlib import asynccontextmanager
 import os
 import time
 import uuid
 import asyncio
-import threading
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi import FastAPI, Depends, HTTPException, Body, Request
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -30,14 +31,11 @@ from fastapi_limiter.depends import RateLimiter
 from utils.auth import create_access_token, verify_token
 from fastapi.security import OAuth2PasswordBearer
 from langchain.agents.middleware import PIIMiddleware
-from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.tools import tool
-from langgraph.graph import END, MessagesState, START, StateGraph
-from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import interrupt, Command
-from utils.tools import booking_hotel, check_availability, get_hotel_policy, get_hotels
 from langchain.agents.middleware import SummarizationMiddleware
-import langchain
+from graph.router_graph import build_router_graph
 # langchain.verbose = True
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -55,97 +53,6 @@ llm = ChatGoogleGenerativeAI(
     streaming=False,
 )
 
-app = FastAPI();
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-_approval_lock = threading.Lock()
-_pending_email_approval: dict[str, str] | None = None
-_THREAD_ID = "chat-session"
-
-
-TRIAGE_TOOLS = [get_hotels, check_availability]
-BOOKING_TOOLS = [booking_hotel]
-POLICY_TOOLS = [get_hotel_policy]
-SWARM_TOOLS = TRIAGE_TOOLS + BOOKING_TOOLS + POLICY_TOOLS
-
-_SWARM_ROUTE_MAP = {
-    "tools": "tools",
-    "triage": "triage",
-    "booking": "booking",
-    "policy": "policy",
-    END: END,
-}
-
-
-def _make_agent_node(system_prompt: str, tools: list):
-    model_with_tools = llm.bind_tools(tools)
-
-    def call_agent(state: MessagesState):
-        response = model_with_tools.invoke(
-            [SystemMessage(content=system_prompt), *state["messages"]]
-        )
-        return {"messages": [response]}
-
-    return call_agent
-
-
-triage_agent = _make_agent_node(
-    "You are a hotel triage assistant. Help users search hotels and check room availability. "
-    "Use get_hotels and check_availability when needed.",
-    TRIAGE_TOOLS,
-)
-booking_agent = _make_agent_node(
-    "You are a hotel booking assistant. Confirm details and use booking_hotel to complete reservations.",
-    BOOKING_TOOLS,
-)
-policy_agent = _make_agent_node(
-    "You are a hotel policy assistant. Answer questions about cancellation, refunds, and check-in rules "
-    "using get_hotel_policy.",
-    POLICY_TOOLS,
-)
-
-
-def swarm_router(
-    state: MessagesState,
-) -> Literal["tools", "triage", "booking", "policy", "__end__"]:
-    last_message = state["messages"][-1]
-
-    # If the LLM made a tool call, send it to the tool execution node
-    if last_message.tool_calls:
-        return "tools"
-
-    # If the last message came from a tool, decide which agent takes over based on the tool's name
-    if isinstance(last_message, ToolMessage):
-        if "booking" in (last_message.name or ""):
-            return "booking"
-        if "policy" in (last_message.name or ""):
-            return "policy"
-        return "triage"
-
-    # If no tools were called, return control back to the user
-    return END
-
-
-builder = StateGraph(MessagesState)
-builder.add_node("triage", triage_agent)
-builder.add_node("booking", booking_agent)
-builder.add_node("policy", policy_agent)
-builder.add_node("tools", ToolNode(SWARM_TOOLS))
-
-builder.add_edge(START, "triage")
-
-for _node in ("triage", "booking", "policy", "tools"):
-    builder.add_conditional_edges(_node, swarm_router, _SWARM_ROUTE_MAP)
-
-swarm = builder.compile(checkpointer=InMemorySaver())
-
-
 
 def _email_request_id(to: str, subject: str, body: str) -> str:
     return f"{to}|{subject}|{body}"
@@ -154,11 +61,14 @@ def _email_request_id(to: str, subject: str, body: str) -> str:
 def _sanitize_approval_payload(payload: dict[str, str] | None) -> dict[str, str] | None:
     if not payload:
         return None
-    return {
-        "id": payload["id"],
-        "to": payload["to"],
-        "subject": payload["subject"],
-    }
+    action = payload.get("action", "send_email")
+    sanitized: dict[str, str] = {"action": action, "id": payload.get("id", "pending")}
+    if action == "send_email":
+        sanitized["to"] = payload.get("to", "unknown")
+        sanitized["subject"] = payload.get("subject", "unknown")
+    elif action == "human_review":
+        sanitized["query"] = payload.get("query", "")
+    return sanitized
 
 
 @tool
@@ -219,13 +129,16 @@ When the user asks to send email / mail / message someone:
 - If they did not give a subject, infer a short subject from context (e.g. first words of the topic, or "(No subject)").
 - Do not stall by asking for subject or extra details in plain text if you can reasonably infer them—the approval step lets a human review the draft."""
 
-agent = create_agent(
+general_agent = create_agent(
     model=llm,
     tools=[send_email],
     system_prompt=_AGENT_SYSTEM_PROMPT,
     middleware=pii_middleware,
     checkpointer=InMemorySaver(),
 )
+
+router_builder = build_router_graph(llm, general_agent)
+router_graph = router_builder.compile(checkpointer=InMemorySaver())
 
 @app.get("/")
 def read_root():
@@ -285,31 +198,47 @@ async def event_generator(
     user_id: str,
 ):
     try:
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}], "system": SystemMessage(content=combined_context)},
-            config={"configurable": {"thread_id": _THREAD_ID}},
+        result = await router_graph.ainvoke(
+            {
+                "messages": [{"role": "user", "content": user_input}],
+                "intent": "",
+                "combined_context": combined_context,
+            },
+            config={"configurable": {"thread_id": session_id}},
         )
-        print("result ----->", result.get("__interrupt__"))
         if isinstance(result, dict) and result.get("__interrupt__"):
-            global _pending_email_approval
+            global _pending_approval
             payload: dict[str, str] = {
-                "id": "pending-email",
-                "to": "unknown",
-                "subject": "unknown",
+                "action": "human_review",
+                "id": "pending-approval",
+                "query": user_input,
             }
             first_interrupt = result["__interrupt__"][0]
             value = getattr(first_interrupt, "value", None)
             if isinstance(value, dict):
+                action = str(value.get("action", "human_review"))
                 payload = {
-                    "id": str(value.get("id", "pending-email")),
-                    "to": str(value.get("to", "unknown")),
-                    "subject": str(value.get("subject", "unknown")),
+                    "action": action,
+                    "id": str(value.get("id", "pending-approval")),
                 }
+                if action == "send_email":
+                    payload["to"] = str(value.get("to", "unknown"))
+                    payload["subject"] = str(value.get("subject", "unknown"))
+                elif action == "human_review":
+                    payload["query"] = str(value.get("query", user_input))
             with _approval_lock:
-                _pending_email_approval = payload
-            yield _sse_data_lines(
-                "[APPROVAL REQUIRED] Pending send_email request. Click 'Approve Send Email'."
-            )
+                _pending_approval = payload
+            if payload.get("action") == "send_email":
+                approval_msg = (
+                    "[APPROVAL REQUIRED] Pending send_email request. "
+                    "Click 'Approve' to continue."
+                )
+            else:
+                approval_msg = (
+                    "[APPROVAL REQUIRED] This request needs human review. "
+                    "Click 'Approve' to escalate to a human agent."
+                )
+            yield _sse_data_lines(approval_msg)
             return
 
         messages = result.get("messages", []) if isinstance(result, dict) else []
@@ -482,30 +411,31 @@ def delete_session(
     return {"status": "deleted", "session_id": session_id}
 
 
-@app.get("/email-approval/pending")
-def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
+def _get_pending_approval(token: Annotated[str, Depends(oauth2_scheme)]):
     _verify_auth_payload(token)
-
     with _approval_lock:
-        pending = _sanitize_approval_payload(_pending_email_approval)
+        pending = _sanitize_approval_payload(_pending_approval)
     return {"pending": pending}
 
 
-@app.post("/email-approval/approve")
-def approve_pending_email(token: Annotated[str, Depends(oauth2_scheme)]):
-    _verify_auth_payload(token)
+def _approve_pending(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session_id: str | None = None,
+):
+    payload_auth = _verify_auth_payload(token)
 
     with _approval_lock:
-        global _pending_email_approval
-        if not _pending_email_approval:
-            raise HTTPException(status_code=404, detail="No pending email approval")
-        approved = _sanitize_approval_payload(_pending_email_approval)
-        _pending_email_approval = None
+        global _pending_approval
+        if not _pending_approval:
+            raise HTTPException(status_code=404, detail="No pending approval")
+        approved = _sanitize_approval_payload(_pending_approval)
+        _pending_approval = None
 
+    thread_id = session_id or payload_auth.get("user_id", "default")
     try:
-        result = agent.invoke(
+        result = router_graph.invoke(
             Command(resume={"approved": True}),
-            config={"configurable": {"thread_id": _THREAD_ID}},
+            config={"configurable": {"thread_id": thread_id}},
         )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         assistant_text = ""
@@ -520,6 +450,32 @@ def approve_pending_email(token: Annotated[str, Depends(oauth2_scheme)]):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Approval resume failed: {e}")
+
+
+@app.get("/approval/pending")
+def get_pending_approval(token: Annotated[str, Depends(oauth2_scheme)]):
+    return _get_pending_approval(token)
+
+
+@app.post("/approval/approve")
+def approve_pending(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session_id: str | None = None,
+):
+    return _approve_pending(token, session_id)
+
+
+@app.get("/email-approval/pending")
+def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
+    return _get_pending_approval(token)
+
+
+@app.post("/email-approval/approve")
+def approve_pending_email(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session_id: str | None = None,
+):
+    return _approve_pending(token, session_id)
 
 
 if __name__ == "__main__":

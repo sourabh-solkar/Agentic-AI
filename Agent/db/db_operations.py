@@ -1,9 +1,9 @@
 import os
+from urllib.parse import quote_plus
 
 import psycopg
 from psycopg.rows import dict_row
-from langchain_postgres import PostgresChatMessageHistory
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 # Configuration
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -13,22 +13,23 @@ load_dotenv()
 
 WINDOW_SIZE = 5  # Keep exactly 5 messages raw
 api_key = os.getenv("GEMINI_API_KEY")
-DB_CONN_STRING = "postgresql://user:password@localhost:5432/chat_db"
 chat_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
 
 
-def get_db_connection():
+def get_database_url() -> str:
     db_url = os.getenv("DATABASE_URL")
     if db_url:
-        return psycopg.connect(db_url, row_factory=dict_row)
-    return psycopg.connect(
-        dbname=os.getenv("DB_NAME", "sessions"),
-        user=os.getenv("DB_USER", "postgres"),
-        password=os.getenv("DB_PASSWORD", ""),
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-        row_factory=dict_row,
-    )
+        return db_url
+    user = quote_plus(os.getenv("DB_USER", "postgres"))
+    password = quote_plus(os.getenv("DB_PASSWORD", ""))
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    dbname = os.getenv("DB_NAME", "sessions")
+    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+
+
+def get_db_connection():
+    return psycopg.connect(get_database_url(), row_factory=dict_row)
 
 # 1. Fetch summary from sessions (primary) with conversation_summaries fallback
 def get_current_summary(conn, session_id: str) -> str:

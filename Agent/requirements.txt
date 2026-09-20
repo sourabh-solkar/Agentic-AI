@@ -5,7 +5,8 @@ langchain_core==1.5.5
 langchain_google_genai==4.3.4
 langchain_postgres==0.0.17
 langgraph==1.2.11
-psycopg==3.3.4
+langgraph-checkpoint-postgres>=2.0.0
+psycopg[binary,pool]==3.3.4
 pydantic==2.13.4
 PyJWT==2.13.0
 pyrate_limiter==4.4.0
