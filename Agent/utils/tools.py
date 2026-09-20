@@ -1,5 +1,6 @@
-from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+from langgraph.prebuilt import ToolRuntime
+from langgraph.types import interrupt
 
 from db import villa_operations
 
@@ -41,10 +42,38 @@ def booking_villa(
     villa_id: int,
     check_in_date: str,
     check_out_date: str,
-    config: RunnableConfig | None = None,
+    runtime: ToolRuntime,
 ) -> str:
-    """Book a villa for the given dates."""
-    configurable = (config or {}).get("configurable") or {}
+    """Book a villa for the given dates. Pauses for human approval before writing the booking."""
+    villa = villa_operations.get_villa_by_id(villa_id)
+    if not villa:
+        return "Villa not found"
+    if villa["rooms_available"] <= 0:
+        return "No rooms available"
+
+    approval = interrupt(
+        {
+            "action": "confirm_booking",
+            "id": f"{villa_id}|{check_in_date}|{check_out_date}",
+            "villa_id": str(villa_id),
+            "villa_name": villa["name"],
+            "location": villa["location"],
+            "check_in_date": check_in_date,
+            "check_out_date": check_out_date,
+            "price_per_night": str(villa["price_per_night"]),
+            "prompt": "Approve this villa booking?",
+        }
+    )
+    approved = False
+    if isinstance(approval, bool):
+        approved = approval
+    elif isinstance(approval, dict):
+        approved = bool(approval.get("approved"))
+
+    if not approved:
+        return "Booking was not approved. No reservation was created."
+
+    configurable = (runtime.config or {}).get("configurable") or {}
     user_id = configurable.get("user_id")
     result = villa_operations.book_villa(
         villa_id,
@@ -54,9 +83,9 @@ def booking_villa(
     )
     if not result.get("ok"):
         return result.get("error") or "Booking failed"
-    villa = result["villa"]
+    booked = result["villa"]
     return (
-        f"Booking confirmed ({result['booking_id']}) at {villa['name']} "
+        f"Booking confirmed ({result['booking_id']}) at {booked['name']} "
         f"from {result['check_in_date']} to {result['check_out_date']}"
     )
 

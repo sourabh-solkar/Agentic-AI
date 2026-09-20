@@ -1,28 +1,34 @@
+import asyncio
+import os
+import sys
+
+# psycopg async cannot use Windows ProactorEventLoop; uvicorn defaults to it.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage
 
 from db.db_operations import (
     append_assistant_message,
     combine_messages,
     create_session_for_user,
     delete_session_for_user,
+    get_database_url,
     get_messages_for_session,
     list_sessions_for_user,
     persist_chat_request,
     session_belongs_to_user,
 )
 from db.user_operations import create_user, get_user_by_username, verify_password
-from db.db_operations import get_database_url
 from langchain.agents import create_agent
 from typing import Annotated, Any
 from contextlib import asynccontextmanager
-import os
 import time
 import uuid
-import asyncio
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException, Body, Request
+from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -36,6 +42,9 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import interrupt, Command
 from langchain.agents.middleware import SummarizationMiddleware
 from graph.router_graph import build_router_graph
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
+
 # langchain.verbose = True
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -58,12 +67,79 @@ def _email_request_id(to: str, subject: str, body: str) -> str:
     return f"{to}|{subject}|{body}"
 
 
+def _interrupt_value(interrupt_obj: Any) -> dict[str, str] | None:
+    value = getattr(interrupt_obj, "value", interrupt_obj)
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _pending_from_snapshot(snapshot: Any, fallback_query: str = "") -> dict[str, str] | None:
+    candidates: list[Any] = []
+    interrupts = getattr(snapshot, "interrupts", None) or ()
+    candidates.extend(interrupts)
+    for task in getattr(snapshot, "tasks", ()) or ():
+        candidates.extend(getattr(task, "interrupts", ()) or ())
+
+    for item in candidates:
+        value = _interrupt_value(item)
+        if value is not None:
+            return _payload_from_interrupt_value(value, fallback_query)
+    return None
+
+
+def _payload_from_interrupt_value(value: dict, fallback_query: str = "") -> dict[str, str]:
+    action = str(value.get("action", "human_review"))
+    payload: dict[str, str] = {
+        "action": action,
+        "id": str(value.get("id", "pending-approval")),
+    }
+    if action == "confirm_booking":
+        payload["villa_id"] = str(value.get("villa_id", ""))
+        payload["villa_name"] = str(value.get("villa_name", "unknown"))
+        payload["location"] = str(value.get("location", ""))
+        payload["check_in_date"] = str(value.get("check_in_date", ""))
+        payload["check_out_date"] = str(value.get("check_out_date", ""))
+        payload["price_per_night"] = str(value.get("price_per_night", ""))
+    elif action == "send_email":
+        payload["to"] = str(value.get("to", "unknown"))
+        payload["subject"] = str(value.get("subject", "unknown"))
+    else:
+        payload["query"] = str(value.get("query", fallback_query))
+    return payload
+
+
+def _approval_message(payload: dict[str, str]) -> str:
+    action = payload.get("action")
+    if action == "confirm_booking":
+        return (
+            "[APPROVAL REQUIRED] Pending villa booking. "
+            "Review the details and click 'Approve' to confirm."
+        )
+    if action == "send_email":
+        return (
+            "[APPROVAL REQUIRED] Pending send_email request. "
+            "Click 'Approve' to continue."
+        )
+    return (
+        "[APPROVAL REQUIRED] This request needs human review. "
+        "Click 'Approve' to escalate to a human agent."
+    )
+
+
 def _sanitize_approval_payload(payload: dict[str, str] | None) -> dict[str, str] | None:
     if not payload:
         return None
-    action = payload.get("action", "send_email")
+    action = payload.get("action", "human_review")
     sanitized: dict[str, str] = {"action": action, "id": payload.get("id", "pending")}
-    if action == "send_email":
+    if action == "confirm_booking":
+        sanitized["villa_id"] = payload.get("villa_id", "")
+        sanitized["villa_name"] = payload.get("villa_name", "unknown")
+        sanitized["location"] = payload.get("location", "")
+        sanitized["check_in_date"] = payload.get("check_in_date", "")
+        sanitized["check_out_date"] = payload.get("check_out_date", "")
+        sanitized["price_per_night"] = payload.get("price_per_night", "")
+    elif action == "send_email":
         sanitized["to"] = payload.get("to", "unknown")
         sanitized["subject"] = payload.get("subject", "unknown")
     elif action == "human_review":
@@ -134,11 +210,45 @@ general_agent = create_agent(
     tools=[send_email],
     system_prompt=_AGENT_SYSTEM_PROMPT,
     middleware=pii_middleware,
-    checkpointer=InMemorySaver(),
 )
 
-router_builder = build_router_graph(llm, general_agent)
-router_graph = router_builder.compile(checkpointer=InMemorySaver())
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AsyncConnectionPool(
+        conninfo=get_database_url(),
+        min_size=1,
+        max_size=10,
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
+    ) as pool:
+        checkpointer = AsyncPostgresSaver(pool)
+        await checkpointer.setup()
+        app.state.router_graph = build_router_graph(llm, general_agent).compile(
+            checkpointer=checkpointer
+        )
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _get_router_graph():
+    graph = getattr(app.state, "router_graph", None)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Agent graph is not ready")
+    return graph
 
 @app.get("/")
 def read_root():
@@ -197,17 +307,18 @@ async def event_generator(
     session_id: str,
     user_id: str,
 ):
+    graph = _get_router_graph()
+    invoke_config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
     try:
-        result = await router_graph.ainvoke(
+        result = await graph.ainvoke(
             {
                 "messages": [{"role": "user", "content": user_input}],
                 "intent": "",
                 "combined_context": combined_context,
             },
-            config={"configurable": {"thread_id": session_id}},
+            config=invoke_config,
         )
         if isinstance(result, dict) and result.get("__interrupt__"):
-            global _pending_approval
             payload: dict[str, str] = {
                 "action": "human_review",
                 "id": "pending-approval",
@@ -216,29 +327,8 @@ async def event_generator(
             first_interrupt = result["__interrupt__"][0]
             value = getattr(first_interrupt, "value", None)
             if isinstance(value, dict):
-                action = str(value.get("action", "human_review"))
-                payload = {
-                    "action": action,
-                    "id": str(value.get("id", "pending-approval")),
-                }
-                if action == "send_email":
-                    payload["to"] = str(value.get("to", "unknown"))
-                    payload["subject"] = str(value.get("subject", "unknown"))
-                elif action == "human_review":
-                    payload["query"] = str(value.get("query", user_input))
-            with _approval_lock:
-                _pending_approval = payload
-            if payload.get("action") == "send_email":
-                approval_msg = (
-                    "[APPROVAL REQUIRED] Pending send_email request. "
-                    "Click 'Approve' to continue."
-                )
-            else:
-                approval_msg = (
-                    "[APPROVAL REQUIRED] This request needs human review. "
-                    "Click 'Approve' to escalate to a human agent."
-                )
-            yield _sse_data_lines(approval_msg)
+                payload = _payload_from_interrupt_value(value, user_input)
+            yield _sse_data_lines(_approval_message(payload))
             return
 
         messages = result.get("messages", []) if isinstance(result, dict) else []
@@ -411,75 +501,103 @@ def delete_session(
     return {"status": "deleted", "session_id": session_id}
 
 
-def _get_pending_approval(token: Annotated[str, Depends(oauth2_scheme)]):
-    _verify_auth_payload(token)
-    with _approval_lock:
-        pending = _sanitize_approval_payload(_pending_approval)
+async def _get_pending_approval(token: str, session_id: str) -> dict:
+    payload_auth = _verify_auth_payload(token)
+    if not session_belongs_to_user(session_id, payload_auth["user_id"]):
+        raise HTTPException(status_code=403, detail="Session not found")
+    graph = _get_router_graph()
+    snapshot = await graph.aget_state(
+        {"configurable": {"thread_id": session_id, "user_id": payload_auth["user_id"]}}
+    )
+    pending = _sanitize_approval_payload(_pending_from_snapshot(snapshot))
     return {"pending": pending}
 
 
-def _approve_pending(
-    token: Annotated[str, Depends(oauth2_scheme)],
-    session_id: str | None = None,
-):
+async def _approve_pending(token: str, session_id: str) -> dict:
     payload_auth = _verify_auth_payload(token)
+    if not session_belongs_to_user(session_id, payload_auth["user_id"]):
+        raise HTTPException(status_code=403, detail="Session not found")
 
-    with _approval_lock:
-        global _pending_approval
-        if not _pending_approval:
-            raise HTTPException(status_code=404, detail="No pending approval")
-        approved = _sanitize_approval_payload(_pending_approval)
-        _pending_approval = None
+    graph = _get_router_graph()
+    invoke_config = {
+        "configurable": {"thread_id": session_id, "user_id": payload_auth["user_id"]}
+    }
+    snapshot = await graph.aget_state(invoke_config)
+    pending = _sanitize_approval_payload(_pending_from_snapshot(snapshot))
+    if not pending:
+        raise HTTPException(status_code=404, detail="No pending approval")
 
-    thread_id = session_id or payload_auth.get("user_id", "default")
     try:
-        result = router_graph.invoke(
+        result = await graph.ainvoke(
             Command(resume={"approved": True}),
-            config={"configurable": {"thread_id": thread_id}},
+            config=invoke_config,
         )
+        if isinstance(result, dict) and result.get("__interrupt__"):
+            raise HTTPException(
+                status_code=500,
+                detail="Approval resume left another interrupt pending",
+            )
         messages = result.get("messages", []) if isinstance(result, dict) else []
         assistant_text = ""
         for message in reversed(messages):
             if isinstance(message, AIMessage):
                 assistant_text = _assistant_text(message)
                 break
+        assistant_text = assistant_text or "Approval recorded."
+        try:
+            append_assistant_message(
+                session_id,
+                assistant_text,
+                user_id=payload_auth["user_id"],
+            )
+        except Exception as persist_err:
+            print("append_assistant_message failed:", persist_err)
         return {
             "status": "approved",
-            "approved": approved,
-            "assistant_message": assistant_text or "Approval recorded.",
+            "approved": pending,
+            "assistant_message": assistant_text,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Approval resume failed: {e}")
 
 
 @app.get("/approval/pending")
-def get_pending_approval(token: Annotated[str, Depends(oauth2_scheme)]):
-    return _get_pending_approval(token)
+async def get_pending_approval(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session_id: str,
+):
+    return await _get_pending_approval(token, session_id)
 
 
 @app.post("/approval/approve")
-def approve_pending(
+async def approve_pending(
     token: Annotated[str, Depends(oauth2_scheme)],
-    session_id: str | None = None,
+    session_id: str,
 ):
-    return _approve_pending(token, session_id)
+    return await _approve_pending(token, session_id)
 
 
 @app.get("/email-approval/pending")
-def get_pending_email_approval(token: Annotated[str, Depends(oauth2_scheme)]):
-    return _get_pending_approval(token)
+async def get_pending_email_approval(
+    token: Annotated[str, Depends(oauth2_scheme)],
+    session_id: str,
+):
+    return await _get_pending_approval(token, session_id)
 
 
 @app.post("/email-approval/approve")
-def approve_pending_email(
+async def approve_pending_email(
     token: Annotated[str, Depends(oauth2_scheme)],
-    session_id: str | None = None,
+    session_id: str,
 ):
-    return _approve_pending(token, session_id)
+    return await _approve_pending(token, session_id)
 
 
 if __name__ == "__main__":
-    if os.name == "nt":
-        # Avoid noisy Proactor socket-accept disconnect traces on Windows.
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    uvicorn.run(app, host="0.0.0.0", port=9005)
+    run_kwargs: dict = {"host": "0.0.0.0", "port": 9005}
+    if sys.platform == "win32":
+        # uvicorn's default asyncio factory is ProactorEventLoop on Windows.
+        run_kwargs["loop"] = "asyncio:SelectorEventLoop"
+    uvicorn.run(app, **run_kwargs)

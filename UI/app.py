@@ -367,7 +367,12 @@ def chat_interface():
     pending_approval = None
     pending_fetch_error = None
     try:
-        pending_resp = requests.get(FASTAPI_APPROVAL_PENDING_URL, headers=headers, timeout=15)
+        pending_resp = requests.get(
+            FASTAPI_APPROVAL_PENDING_URL,
+            headers=headers,
+            params={"session_id": st.session_state.session_id},
+            timeout=15,
+        )
         if pending_resp.status_code == 200:
             pending_approval = pending_resp.json().get("pending")
         else:
@@ -385,8 +390,26 @@ def chat_interface():
 
     if need_approval_ui:
         with st.container(border=True):
-            action = (pending_approval or {}).get("action", "send_email")
-            if action == "human_review":
+            action = (pending_approval or {}).get("action", "human_review")
+            if action == "confirm_booking":
+                st.markdown("### Confirm booking")
+                st.caption(
+                    "The assistant paused before writing the reservation. "
+                    "Review the details, then approve to complete the booking."
+                )
+                if pending_approval:
+                    st.write(f"**Villa:** {pending_approval.get('villa_name', 'unknown')}")
+                    st.write(f"**Location:** {pending_approval.get('location', '')}")
+                    st.write(
+                        f"**Check-in:** `{pending_approval.get('check_in_date', '')}`"
+                    )
+                    st.write(
+                        f"**Check-out:** `{pending_approval.get('check_out_date', '')}`"
+                    )
+                    price = pending_approval.get("price_per_night")
+                    if price:
+                        st.write(f"**Price / night:** ₹{price}")
+            elif action == "human_review":
                 st.markdown("### Human review required")
                 st.caption(
                     "This request is outside automated handling. "
@@ -407,11 +430,12 @@ def chat_interface():
                     "Pending details did not load from the API; you can still try approving "
                     "if this chat turn showed **[APPROVAL REQUIRED]**."
                 )
-            approve_label = (
-                "Approve escalation"
-                if action == "human_review"
-                else "Approve Send Email"
-            )
+            if action == "confirm_booking":
+                approve_label = "Approve booking"
+            elif action == "human_review":
+                approve_label = "Approve escalation"
+            else:
+                approve_label = "Approve Send Email"
             if st.button(approve_label, type="primary", key="approve_main"):
                 ok, err, resumed_message = post_approval(
                     headers, st.session_state.get("session_id")

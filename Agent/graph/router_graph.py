@@ -20,8 +20,8 @@ from utils.tools import (
 )
 
 AVAILABILITY_TOOLS = [get_villas, find_villa_by_name, check_availability]
-BOOKING_TOOLS = [booking_villa]
-POLICY_TOOLS = [get_villa_policy]
+BOOKING_TOOLS = [find_villa_by_name, get_villas, check_availability, booking_villa]
+POLICY_TOOLS = [find_villa_by_name, get_villa_policy]
 ALL_BOOKING_TOOLS = AVAILABILITY_TOOLS + BOOKING_TOOLS + POLICY_TOOLS
 
 
@@ -117,7 +117,13 @@ def build_router_graph(llm, general_agent):
         context = state.get("combined_context", "")
         system = (
             "You are a villa booking assistant. "
-            "Confirm villa and dates, then use booking_villa to complete the reservation."
+            "Never ask the user for a villa ID. "
+            "If they give a villa name, call find_villa_by_name (or get_villas by location) "
+            "to resolve the id yourself. "
+            "Once you have villa_id and check-in/check-out dates, call booking_villa immediately. "
+            "booking_villa pauses for human approval before the booking is written — "
+            "do not claim the booking is done until the tool returns a confirmation. "
+            "If dates are missing, ask only for dates."
         )
         if context:
             system = f"{system}\n\nConversation context:\n{context}"
@@ -130,7 +136,8 @@ def build_router_graph(llm, general_agent):
         context = state.get("combined_context", "")
         system = (
             "You are a villa policy assistant. "
-            "Use get_villa_policy for cancellation, refund, and check-in questions."
+            "Never ask for a villa ID — use find_villa_by_name first if given a name, "
+            "then get_villa_policy for cancellation, refund, and check-in questions."
         )
         if context:
             system = f"{system}\n\nConversation context:\n{context}"
