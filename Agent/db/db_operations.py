@@ -5,15 +5,14 @@ import psycopg
 from psycopg.rows import dict_row
 from langchain_core.messages import HumanMessage, AIMessage
 
-# Configuration
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
+
+from utils.llm import get_chat_llm
 
 load_dotenv()
 
 WINDOW_SIZE = 5  # Keep exactly 5 messages raw
-api_key = os.getenv("GEMINI_API_KEY")
-chat_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
+chat_llm = get_chat_llm()
 
 
 def get_database_url() -> str:

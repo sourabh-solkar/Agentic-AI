@@ -24,4 +24,22 @@ DATABASE_URL=postgresql://postgres:@localhost:5432/sessions
 DEFAULT_ADMIN_USERNAME=admin
 DEFAULT_ADMIN_PASSWORD=admin
 
+# Free LLM providers (fallback chain). Set any combination of keys.
+# Order: FREE_LLM_ORDER=gemini,groq,grok,openrouter,cerebras
 GEMINI_API_KEY=<your-gemini-api-key>
+GEMINI_MODEL=gemini-2.5-flash
+
+GROQ_API_KEY=<your-groq-api-key>
+GROQ_MODEL=llama-3.3-70b-versatile
+
+XAI_API_KEY=<your-xai-grok-api-key>
+GROK_MODEL=grok-4-fast
+
+OPENROUTER_API_KEY=<your-openrouter-api-key>
+OPENROUTER_MODEL=openrouter/free
+
+CEREBRAS_API_KEY=<your-cerebras-api-key>
+CEREBRAS_MODEL=llama-3.3-70b
+
+# Optional override of provider order
+# FREE_LLM_ORDER=gemini,groq,grok,openrouter,cerebras

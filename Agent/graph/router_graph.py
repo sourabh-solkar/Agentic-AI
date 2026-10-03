@@ -58,15 +58,31 @@ Classify the user message into exactly one intent:
 When unsure between availability and booking, pick availability if they only ask "is X available"."""
 
 
-def build_router_graph(llm, general_agent):
-    """Build and compile the top-level LangGraph router."""
+def build_router_graph(llm, general_agent, provider_models: list | None = None):
+    """Build and compile the top-level LangGraph router.
 
-    availability_model = llm.bind_tools(AVAILABILITY_TOOLS)
-    booking_model = llm.bind_tools(BOOKING_TOOLS)
-    policy_model = llm.bind_tools(POLICY_TOOLS)
+    `llm` is used when only one provider is available. When `provider_models` is
+    a list of (name, model) pairs, each tool/structured call falls back across
+    free providers on quota/rate-limit failures.
+    """
+    from utils.llm import apply_to_each_provider
+
+    models = provider_models or [("primary", llm)]
+
+    availability_model = apply_to_each_provider(
+        models, lambda m: m.bind_tools(AVAILABILITY_TOOLS)
+    )
+    booking_model = apply_to_each_provider(
+        models, lambda m: m.bind_tools(BOOKING_TOOLS)
+    )
+    policy_model = apply_to_each_provider(
+        models, lambda m: m.bind_tools(POLICY_TOOLS)
+    )
+    classifier = apply_to_each_provider(
+        models, lambda m: m.with_structured_output(IntentClassification)
+    )
 
     def classify_intent(state: RouterState) -> dict:
-        classifier = llm.with_structured_output(IntentClassification)
         last_user = next(
             (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
             None,

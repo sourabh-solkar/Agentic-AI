@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 
@@ -23,6 +22,7 @@ from db.db_operations import (
     persist_chat_request,
     session_belongs_to_user,
 )
+from utils.llm import get_provider_models, with_provider_fallbacks
 from db.user_operations import create_user, get_user_by_username, verify_password
 from langchain.agents import create_agent
 from typing import Annotated, Any
@@ -49,7 +49,6 @@ from psycopg_pool import AsyncConnectionPool
 
 # langchain.verbose = True
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 origins = [
 
@@ -58,11 +57,13 @@ origins = [
     "http://localhost:3000/"
 ]
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=api_key,
-    streaming=False,
+# Free-tier chain: Gemini -> Groq -> Grok -> OpenRouter -> Cerebras (keys optional).
+_provider_models = get_provider_models()
+llm = with_provider_fallbacks(
+    [model for _, model in _provider_models],
+    names=[name for name, _ in _provider_models],
 )
+_primary_llm = _provider_models[0][1]
 
 
 def _email_request_id(to: str, subject: str, body: str) -> str:
@@ -177,7 +178,8 @@ def send_email(to: str, subject: str, body: str) -> str:
     )
 
 
-pii_middleware = [
+def _build_pii_middleware(summary_model):
+    return [
         # Do not redact emails on input: the model must see real addresses to call
         # send_email correctly; HITL approval is the safety gate instead.
         PIIMiddleware("credit_card", strategy="mask", apply_to_input=True),
@@ -185,16 +187,13 @@ pii_middleware = [
         PIIMiddleware("mac_address", strategy="redact", apply_to_input=True),
         PIIMiddleware("url", strategy="redact", apply_to_input=True),
         SummarizationMiddleware(
-            model=llm,
+            model=summary_model,
             trigger=("tokens", 600),
             keep=("messages", 10),
             summary_prompt=(
                 "You are a helpful assistant. Summarize the conversation history in a concise manner."
             ),
         ),
-         # Layer 4: Model-based safety check (after agent)
-        # SafetyGuardrailMiddleware(),
-         # Persist the state across interrupts
     ]
 
 
@@ -207,11 +206,19 @@ When the user asks to send email / mail / message someone:
 - If they did not give a subject, infer a short subject from context (e.g. first words of the topic, or "(No subject)").
 - Do not stall by asking for subject or extra details in plain text if you can reasonably infer them—the approval step lets a human review the draft."""
 
-general_agent = create_agent(
-    model=llm,
-    tools=[send_email],
-    system_prompt=_AGENT_SYSTEM_PROMPT,
-    middleware=pii_middleware,
+# One agent per free provider, then chain so quota failures fail over.
+_general_agents = [
+    create_agent(
+        model=model,
+        tools=[send_email],
+        system_prompt=_AGENT_SYSTEM_PROMPT,
+        middleware=_build_pii_middleware(model),
+    )
+    for _, model in _provider_models
+]
+general_agent = with_provider_fallbacks(
+    _general_agents,
+    names=[name for name, _ in _provider_models],
 )
 
 
@@ -229,7 +236,11 @@ async def lifespan(app: FastAPI):
     ) as pool:
         checkpointer = AsyncPostgresSaver(pool)
         await checkpointer.setup()
-        app.state.router_graph = build_router_graph(llm, general_agent).compile(
+        app.state.router_graph = build_router_graph(
+            _primary_llm,
+            general_agent,
+            provider_models=_provider_models,
+        ).compile(
             checkpointer=checkpointer
         )
         yield
