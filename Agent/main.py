@@ -281,12 +281,63 @@ def _assistant_text(message: AIMessage) -> str:
     return ""
 
 
-def _sse_data_lines(text: str) -> str:
-    """One SSE event; prefix each newline per https://html.spec.whatwg.org/multipage/server-sent-events.html"""
+def _sse_event(event: str, text: str) -> str:
+    """One SSE event; prefix each newline per the SSE spec."""
     if not text:
         return ""
-   
-    return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"
+    data = "".join(f"data: {line}\n" for line in text.split("\n"))
+    return f"event: {event}\n{data}\n"
+
+
+_NODE_STATUS = {
+    "classify": "Classifying your request",
+    "inject_context": "Loading conversation context",
+    "general_agent": "Answering",
+    "availability_agent": "Checking availability",
+    "availability_tools": "Looking up villas",
+    "suggest_alternatives": "Finding alternative villas",
+    "booking_agent": "Preparing the booking",
+    "booking_tools": "Running booking steps",
+    "policy_agent": "Looking up the villa policy",
+    "policy_tools": "Fetching policy details",
+    "human_escalation": "Escalating to a human agent",
+}
+
+
+def _latest_assistant_text(messages: list) -> str:
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            text = _assistant_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _payload_from_stream_interrupt(raw: Any, fallback_query: str) -> dict[str, str]:
+    items = raw if isinstance(raw, (list, tuple)) else (raw,)
+    for item in items:
+        value = _interrupt_value(item)
+        if value is None and isinstance(item, dict):
+            inner = item.get("value", item)
+            value = inner if isinstance(inner, dict) else None
+        if value is not None:
+            return _payload_from_interrupt_value(value, fallback_query)
+    return {
+        "action": "human_review",
+        "id": "pending-approval",
+        "query": fallback_query,
+    }
+
+
+def _collect_update_messages(chunk: dict, messages: list) -> None:
+    for update in chunk.values():
+        if not isinstance(update, dict):
+            continue
+        new_messages = update.get("messages")
+        if isinstance(new_messages, list):
+            messages.extend(new_messages)
+        elif new_messages is not None:
+            messages.append(new_messages)
 
 
 def _verify_auth_payload(token: str) -> dict:
@@ -301,52 +352,136 @@ def _verify_auth_payload(token: str) -> dict:
     return payload
 
 
+async def _stream_graph_parts(
+    graph: Any,
+    graph_input: Any,
+    invoke_config: dict,
+):
+    """Yield `(mode, data)` graph events without breaking `interrupt()` on Python 3.10.
+
+    Async `astream`/`ainvoke` lose the runnable config contextvars below 3.11, so
+    `interrupt()` raises. Sync `stream` in a worker thread keeps that context and
+    still works with AsyncPostgresSaver (which bridges sync calls via the loop).
+    """
+    stream_mode = ["tasks", "updates"]
+    if sys.version_info >= (3, 11):
+        async for part in graph.astream(
+            graph_input,
+            config=invoke_config,
+            stream_mode=stream_mode,
+        ):
+            yield part
+        return
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[bool | None, Any]] = asyncio.Queue()
+
+    def _worker() -> None:
+        try:
+            for part in graph.stream(
+                graph_input,
+                config=invoke_config,
+                stream_mode=stream_mode,
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, (True, part))
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, (False, exc))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, (None, None))
+
+    worker_fut = loop.run_in_executor(None, _worker)
+    try:
+        while True:
+            ok, payload = await queue.get()
+            if ok is None:
+                break
+            if ok is False:
+                raise payload
+            yield payload
+    finally:
+        await worker_fut
+
+
+async def _iter_graph_sse(
+    graph_input: Any,
+    invoke_config: dict,
+    session_id: str,
+    user_id: str,
+    fallback_query: str,
+):
+    """Yield a status event when each graph node starts, then the final answer.
+
+    `tasks` events are queued before a node runs, so the UI can show the step
+    while that node is still working. The assistant text is a separate `message`
+    event and is the only part persisted.
+    """
+    graph = _get_router_graph()
+    yield _sse_event("status", "Starting")
+    messages: list = []
+    interrupt_payload: dict[str, str] | None = None
+
+    async for part in _stream_graph_parts(graph, graph_input, invoke_config):
+        if not isinstance(part, tuple) or len(part) != 2:
+            continue
+        mode, data = part
+        if mode == "tasks" and isinstance(data, dict) and "result" not in data:
+            label = _NODE_STATUS.get(str(data.get("name", "")))
+            if label:
+                yield _sse_event("status", label)
+            continue
+        if mode != "updates" or not isinstance(data, dict):
+            continue
+        if "__interrupt__" in data:
+            interrupt_payload = _payload_from_stream_interrupt(
+                data["__interrupt__"], fallback_query
+            )
+            yield _sse_event("status", "Waiting for your approval")
+            continue
+        _collect_update_messages(data, messages)
+
+    if interrupt_payload is None:
+        snapshot = await graph.aget_state(invoke_config)
+        interrupt_payload = _pending_from_snapshot(snapshot, fallback_query)
+        if interrupt_payload:
+            yield _sse_event("status", "Waiting for your approval")
+        elif not _latest_assistant_text(messages):
+            state_values = getattr(snapshot, "values", None) or {}
+            messages = list(state_values.get("messages") or [])
+
+    if interrupt_payload:
+        yield _sse_event("message", _approval_message(interrupt_payload))
+        return
+
+    assistant_text = _latest_assistant_text(messages) or "I could not generate a response."
+    try:
+        append_assistant_message(session_id, assistant_text, user_id=user_id)
+    except Exception as persist_err:
+        print("append_assistant_message failed:", persist_err)
+    yield _sse_event("message", assistant_text)
+
+
 async def event_generator(
     user_input: str,
     combined_context: str,
     session_id: str,
     user_id: str,
 ):
-    graph = _get_router_graph()
     invoke_config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
     try:
-        result = await graph.ainvoke(
+        async for piece in _iter_graph_sse(
             {
                 "messages": [{"role": "user", "content": user_input}],
                 "intent": "",
                 "combined_context": combined_context,
             },
-            config=invoke_config,
-        )
-        if isinstance(result, dict) and result.get("__interrupt__"):
-            payload: dict[str, str] = {
-                "action": "human_review",
-                "id": "pending-approval",
-                "query": user_input,
-            }
-            first_interrupt = result["__interrupt__"][0]
-            value = getattr(first_interrupt, "value", None)
-            if isinstance(value, dict):
-                payload = _payload_from_interrupt_value(value, user_input)
-            yield _sse_data_lines(_approval_message(payload))
-            return
-
-        messages = result.get("messages", []) if isinstance(result, dict) else []
-        assistant_text = ""
-        for message in reversed(messages):
-            if isinstance(message, AIMessage):
-                assistant_text = _assistant_text(message)
-                break
-
-        if not assistant_text:
-            assistant_text = "I could not generate a response."
-        try:
-            append_assistant_message(session_id, assistant_text, user_id=user_id)
-        except Exception as persist_err:
-            print("append_assistant_message failed:", persist_err)
-        yield _sse_data_lines(assistant_text)
+            invoke_config,
+            session_id,
+            user_id,
+            user_input,
+        ):
+            yield piece
     except Exception as e:
-        yield _sse_data_lines(f"[error] {e}")
+        yield _sse_event("message", f"[error] {e}")
     finally:
         yield "event: done\ndata: [DONE]\n\n"
 
@@ -370,11 +505,6 @@ async def chat(
         if not user_message:
             raise HTTPException(status_code=400, detail="`message` is required")
 
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
         resolved_session_id = session_id or (request.session_id if request else None)
         if not resolved_session_id:
             raise HTTPException(status_code=400, detail="`session_id` is required")
@@ -396,8 +526,7 @@ async def chat(
         return StreamingResponse(
             event_generator(user_message, combined_context, resolved_session_id, user_id),
             media_type="text/event-stream",
-            headers=headers,
-           
+            headers=_SSE_HEADERS,
         )
     except HTTPException:
         raise
@@ -513,54 +642,43 @@ async def _get_pending_approval(token: str, session_id: str) -> dict:
     return {"pending": pending}
 
 
-async def _approve_pending(token: str, session_id: str) -> dict:
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+async def _pending_approval_context(token: str, session_id: str) -> tuple[str, dict]:
+    """Auth-check and confirm an interrupt is waiting. Raises before any SSE bytes."""
     payload_auth = _verify_auth_payload(token)
-    if not session_belongs_to_user(session_id, payload_auth["user_id"]):
+    user_id = payload_auth["user_id"]
+    if not session_belongs_to_user(session_id, user_id):
         raise HTTPException(status_code=403, detail="Session not found")
 
     graph = _get_router_graph()
-    invoke_config = {
-        "configurable": {"thread_id": session_id, "user_id": payload_auth["user_id"]}
-    }
+    invoke_config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
     snapshot = await graph.aget_state(invoke_config)
     pending = _sanitize_approval_payload(_pending_from_snapshot(snapshot))
     if not pending:
         raise HTTPException(status_code=404, detail="No pending approval")
+    return user_id, invoke_config
 
+
+async def _approval_event_generator(session_id: str, user_id: str, invoke_config: dict):
     try:
-        result = await graph.ainvoke(
+        async for piece in _iter_graph_sse(
             Command(resume={"approved": True}),
-            config=invoke_config,
-        )
-        if isinstance(result, dict) and result.get("__interrupt__"):
-            raise HTTPException(
-                status_code=500,
-                detail="Approval resume left another interrupt pending",
-            )
-        messages = result.get("messages", []) if isinstance(result, dict) else []
-        assistant_text = ""
-        for message in reversed(messages):
-            if isinstance(message, AIMessage):
-                assistant_text = _assistant_text(message)
-                break
-        assistant_text = assistant_text or "Approval recorded."
-        try:
-            append_assistant_message(
-                session_id,
-                assistant_text,
-                user_id=payload_auth["user_id"],
-            )
-        except Exception as persist_err:
-            print("append_assistant_message failed:", persist_err)
-        return {
-            "status": "approved",
-            "approved": pending,
-            "assistant_message": assistant_text,
-        }
-    except HTTPException:
-        raise
+            invoke_config,
+            session_id,
+            user_id,
+            "",
+        ):
+            yield piece
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Approval resume failed: {e}")
+        yield _sse_event("message", f"[error] {e}")
+    finally:
+        yield "event: done\ndata: [DONE]\n\n"
 
 
 @app.get("/approval/pending")
@@ -576,7 +694,12 @@ async def approve_pending(
     token: Annotated[str, Depends(oauth2_scheme)],
     session_id: str,
 ):
-    return await _approve_pending(token, session_id)
+    user_id, invoke_config = await _pending_approval_context(token, session_id)
+    return StreamingResponse(
+        _approval_event_generator(session_id, user_id, invoke_config),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 @app.get("/email-approval/pending")
@@ -592,7 +715,12 @@ async def approve_pending_email(
     token: Annotated[str, Depends(oauth2_scheme)],
     session_id: str,
 ):
-    return await _approve_pending(token, session_id)
+    user_id, invoke_config = await _pending_approval_context(token, session_id)
+    return StreamingResponse(
+        _approval_event_generator(session_id, user_id, invoke_config),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 if __name__ == "__main__":

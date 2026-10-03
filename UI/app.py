@@ -208,26 +208,36 @@ if "sessions_list" not in st.session_state:
     st.session_state.sessions_list = []
 
 
-def post_approval(headers: dict[str, str], session_id: str | None = None) -> tuple[bool, str, str]:
-    """POST /approval/approve. Returns (ok, error_detail, assistant_message)."""
-    try:
-        params = {"session_id": session_id} if session_id else None
-        approve_resp = requests.post(
-            FASTAPI_APPROVAL_APPROVE_URL,
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        if approve_resp.status_code == 200:
-            data = approve_resp.json()
-            return True, "", (data.get("assistant_message") or "").strip()
-        return False, approve_resp.text or f"HTTP {approve_resp.status_code}", ""
-    except requests.RequestException as e:
-        return False, str(e), ""
+def _read_sse(resp, on_status, on_message) -> str:
+    """Read a graph SSE stream. Status lines are live steps; message lines are the answer."""
+    full_response = ""
+    current_event = "message"
+    for raw_line in resp:
+        line = raw_line.decode("utf-8", errors="replace").strip()
 
+        if not line:
+            current_event = "message"
+            continue
 
-def post_email_approval(headers: dict[str, str]) -> tuple[bool, str, str]:
-    return post_approval(headers, st.session_state.get("session_id"))
+        if line.startswith("event:"):
+            current_event = line.split(":", 1)[1].strip()
+            continue
+
+        if not line.startswith("data:"):
+            continue
+
+        data = line.split(":", 1)[1].lstrip()
+
+        if current_event == "done" or data == "[DONE]":
+            break
+
+        if current_event == "status":
+            on_status(data)
+            continue
+
+        full_response += data + "\n"
+        on_message(full_response)
+    return full_response
 
 
 def login():
@@ -437,19 +447,59 @@ def chat_interface():
             else:
                 approve_label = "Approve Send Email"
             if st.button(approve_label, type="primary", key="approve_main"):
-                ok, err, resumed_message = post_approval(
-                    headers, st.session_state.get("session_id")
+                run_status = st.status("Resuming…", expanded=True)
+                message_placeholder = st.empty()
+                resumed_message = ""
+                approve_url = (
+                    f"{FASTAPI_APPROVAL_APPROVE_URL}?"
+                    + urllib.parse.urlencode(
+                        {"session_id": st.session_state.session_id or ""}
+                    )
                 )
-                if ok:
-                    if resumed_message:
+                approve_request = urllib.request.Request(
+                    approve_url,
+                    data=b"",
+                    headers=headers,
+                    method="POST",
+                )
+                approve_ok = False
+                try:
+                    with urllib.request.urlopen(approve_request, timeout=120) as resp:
+                        resumed_message = _read_sse(
+                            resp,
+                            on_status=lambda step: (
+                                run_status.write(step),
+                                run_status.update(label=step),
+                            ),
+                            on_message=lambda text: message_placeholder.markdown(
+                                text.rstrip("\n") + "▌"
+                            ),
+                        )
+                    run_status.update(label="Finished", state="complete", expanded=True)
+                    message_placeholder.markdown(resumed_message.rstrip("\n"))
+                    approve_ok = True
+                except urllib.error.HTTPError as e:
+                    run_status.update(label="Approval failed", state="error")
+                    detail = e.read().decode(errors="replace")
+                    st.error(f"Approval failed: HTTP {e.code} — {detail}")
+                except urllib.error.URLError as e:
+                    run_status.update(label="Approval failed", state="error")
+                    st.error(f"Approval failed: {e.reason}")
+
+                if approve_ok and resumed_message.startswith("[error]"):
+                    run_status.update(label="Approval failed", state="error")
+                    st.error(resumed_message.strip())
+                    approve_ok = False
+
+                if approve_ok:
+                    if resumed_message.strip():
                         st.session_state.messages.append(
                             {"role": "assistant", "content": resumed_message}
                         )
-                    st.session_state.approval_requested = False
-                    st.success("Approved and resumed.")
+                    st.session_state.approval_requested = (
+                        "[APPROVAL REQUIRED]" in resumed_message
+                    )
                     st.rerun()
-                else:
-                    st.error(f"Approval failed: {err}")
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -464,6 +514,7 @@ def chat_interface():
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
+        run_status = st.status("Working…", expanded=True)
         message_placeholder = st.empty()
         full_response = ""
         query = urllib.parse.urlencode({
@@ -478,29 +529,22 @@ def chat_interface():
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as resp:
-                current_event = "message"
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-
-                    if not line:
-                        current_event = "message"
-                        continue
-
-                    if line.startswith("event:"):
-                        current_event = line.split(":", 1)[1].strip()
-                        continue
-
-                    if not line.startswith("data:"):
-                        continue
-
-                    data = line.split(":", 1)[1].lstrip()
-
-                    if current_event == "done" or data == "[DONE]":
-                        break
-
-                    full_response += data + "\n"
-                    message_placeholder.markdown(full_response.rstrip("\n") + "▌")
+                full_response = _read_sse(
+                    resp,
+                    on_status=lambda step: (
+                        run_status.write(step),
+                        run_status.update(label=step),
+                    ),
+                    on_message=lambda text: message_placeholder.markdown(
+                        text.rstrip("\n") + "▌"
+                    ),
+                )
+            if full_response.startswith("[error]"):
+                run_status.update(label="Something went wrong", state="error", expanded=True)
+            else:
+                run_status.update(label="Finished", state="complete", expanded=True)
         except urllib.error.HTTPError as e:
+            run_status.update(label="Request failed", state="error")
             if e.code in (401, 403):
                 _browser_persist_auth(None, None)
                 _clear_auth_state()
@@ -511,6 +555,7 @@ def chat_interface():
             else:
                 full_response = f"HTTP error from API: {e.code} — {e.read().decode(errors='replace')}"
         except urllib.error.URLError as e:
+            run_status.update(label="Request failed", state="error")
             full_response = (
                 f"Could not reach `{FASTAPI_CHAT_URL}`. "
                 f"Start the API (`Agent/main.py`) and ensure FASTAPI_PORT matches uvicorn "

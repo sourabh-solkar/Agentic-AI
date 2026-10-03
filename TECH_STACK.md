@@ -13,7 +13,7 @@ This project is built with Python and is organized into three main parts:
 - **Uvicorn**: ASGI server used to run FastAPI apps.
 - **Pydantic**: request/response data modeling (`BaseModel`).
 - **FastAPI CORS Middleware**: cross-origin request support.
-- **Server-Sent Events (SSE)**: streaming chat responses from backend to UI.
+- **Server-Sent Events (SSE)**: streaming chat/approval responses from backend to UI (live graph `status` steps + final `message`; see [`docs/SSE_STREAMING.md`](docs/SSE_STREAMING.md)).
 - **pyrate-limiter + fastapi-limiter**: request rate limiting.
 
 ## LLM and Agent Framework

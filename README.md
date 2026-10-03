@@ -44,6 +44,10 @@ cd MCP
 python server.py
 ```
 
+## Docs
+
+- [SSE streaming (UI + backend)](docs/SSE_STREAMING.md) — how live graph status and final answers are streamed over SSE, including the Python 3.10 `interrupt()` workaround.
+
 ## Dependencies
 
 Project dependencies are declared in `pyproject.toml`. After adding or changing a package:
