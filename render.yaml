@@ -1,0 +1,39 @@
+# Render Blueprint — Agent API (repo-root build; no Root Directory required)
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: villa-assistant-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r Agent/requirements.txt
+    startCommand: bash -c "cd Agent && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: ALGORITHM
+        value: HS256
+      - key: CORS_ALLOW_ALL
+        value: "true"
+      - key: FREE_QUESTION_CREDITS
+        value: "30"
+      - key: TOKENS_PER_CREDIT
+        value: "1000"
+      - key: CREDIT_HOLD_AMOUNT
+        value: "1"
+      - key: MIN_CREDITS_PER_TURN
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: SECREAT_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: FREE_LLM_ORDER
+        value: gemini,groq,grok,openrouter,cerebras
+      - key: LANGSMITH_TRACING
+        value: "false"

@@ -1,0 +1,65 @@
+
+LANGSMITH_TRACING=true
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGSMITH_API_KEY=<your-langsmith-api-key>
+LANGSMITH_PROJECT="<your-langsmith-project>"
+
+ANTHROPIC_API_KEY=<your-anthropic-api-key>
+
+# Auth
+SECREAT_KEY=<your-jwt-secret>
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+
+# PostgreSQL (optional — defaults shown)
+DATABASE_URL=postgresql://postgres:@localhost:5432/sessions
+# Or use individual vars:
+# DB_NAME=sessions
+# DB_USER=postgres
+# DB_PASSWORD=
+# DB_HOST=localhost
+# DB_PORT=5432
+
+# UI → API (Streamlit). Prefer full URL in prod:
+# FASTAPI_BASE_URL=https://villa-assistant-api.onrender.com
+# Local default is http://127.0.0.1:9005 via:
+# FASTAPI_HOST=127.0.0.1
+# FASTAPI_PORT=9005
+
+# Render / cloud listen port (set automatically on Render as PORT)
+# PORT=9005
+# CORS_ALLOW_ALL=true
+# CORS_ORIGINS=https://your-app.streamlit.app
+
+# Default admin seeded by: python -m db.init_db (from Agent/)
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=admin
+
+# Free-tier credits granted on Gmail registration (token-metered after each turn)
+FREE_QUESTION_CREDITS=30
+
+# Token → credit billing (provider usage_metadata is the source of truth)
+# credits_charged = max(MIN_CREDITS_PER_TURN, ceil(total_tokens / TOKENS_PER_CREDIT))
+TOKENS_PER_CREDIT=1000
+CREDIT_HOLD_AMOUNT=1
+MIN_CREDITS_PER_TURN=1
+
+# Free LLM providers (fallback chain). Set any combination of keys.
+# Order: FREE_LLM_ORDER=gemini,groq,grok,openrouter,cerebras
+GEMINI_API_KEY=<your-gemini-api-key>
+GEMINI_MODEL=gemini-2.5-flash
+
+GROQ_API_KEY=<your-groq-api-key>
+GROQ_MODEL=llama-3.3-70b-versatile
+
+XAI_API_KEY=<your-xai-grok-api-key>
+GROK_MODEL=grok-4-fast
+
+OPENROUTER_API_KEY=<your-openrouter-api-key>
+OPENROUTER_MODEL=openrouter/free
+
+CEREBRAS_API_KEY=<your-cerebras-api-key>
+CEREBRAS_MODEL=llama-3.3-70b
+
+# Optional override of provider order
+# FREE_LLM_ORDER=gemini,groq,grok,openrouter,cerebras

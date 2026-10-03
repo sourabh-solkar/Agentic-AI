@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentic-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-sessions}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./Agent/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-sessions}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  db-init:
+    build: ./Agent
+    container_name: agentic-db-init
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-sessions}
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_NAME:-sessions}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "db/init_db.py"]
+    restart: "no"
+
+  agent:
+    build: ./Agent
+    container_name: agentic-agent
+    restart: unless-stopped
+    ports:
+      - "9005:9005"
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-sessions}
+      DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/${DB_NAME:-sessions}
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  ui:
+    build: ./UI
+    container_name: agentic-ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      FASTAPI_HOST: agent
+      FASTAPI_PORT: 9005
+    depends_on:
+      - agent
+
+volumes:
+  postgres_data:

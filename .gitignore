@@ -12,8 +12,15 @@ ENV/
 # Environment and secrets
 .env
 .env.*
+env-dev
 *.pem
 *.key
+
+# Neon local link context (org/project/branch ids; may pull secrets via CLI)
+.neon
+
+# Local agent tooling (optional; do not ship secrets)
+.cursor/mcp.json
 
 # Build and packaging artifacts
 build/
@@ -41,3 +48,4 @@ Thumbs.db
 
 # Streamlit local state
 .streamlit/secrets.toml
+./agents/*
