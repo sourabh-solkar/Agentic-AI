@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
+    credits INTEGER NOT NULL DEFAULT 30 CHECK (credits >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -51,8 +52,49 @@ ALTER TABLE sessions ALTER COLUMN updated_at SET DEFAULT NOW();
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS trace_id TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS trace_url TEXT;
 
+-- Credits for free-tier questions (subscription gate).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS credits INTEGER DEFAULT 30;
+UPDATE users SET credits = 30 WHERE credits IS NULL;
+ALTER TABLE users ALTER COLUMN credits SET DEFAULT 30;
+ALTER TABLE users ALTER COLUMN credits SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user_updated ON sessions(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at ASC);
+
+-- Token-usage ledger + per-turn credit holds (hold → meter → settle).
+-- session_id is stored without an FK: live DBs may use uuid or text for sessions.session_id.
+CREATE TABLE IF NOT EXISTS credit_holds (
+    run_id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id TEXT,
+    amount INTEGER NOT NULL CHECK (amount > 0),
+    status TEXT NOT NULL DEFAULT 'held'
+        CHECK (status IN ('held', 'settled', 'released')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    settled_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id TEXT,
+    run_id UUID,
+    provider TEXT,
+    model TEXT,
+    purpose TEXT NOT NULL DEFAULT 'chat',
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    credits_charged INTEGER NOT NULL DEFAULT 0 CHECK (credits_charged >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_holds_user_status
+    ON credit_holds(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_usage_events_user_created
+    ON usage_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_usage_events_run
+    ON usage_events(run_id);
 
 CREATE TABLE IF NOT EXISTS villas (
     id INTEGER PRIMARY KEY,

@@ -29,6 +29,7 @@ Async runners below 3.11 drop the runnable config `contextvars` that `interrupt(
 | `status` | Live step label while a node is working | No |
 | `message` | Final assistant text (or approval prompt / `[error] …`) | Yes (assistant text only) |
 | `trace` | JSON with `trace_id`, `trace_url`, `message_id` for this turn | Yes (`trace_*` on the assistant row) |
+| `credits` | JSON billing settle for the turn (`credits`, `credits_charged`, token counts) | Yes (`usage_events` + credit hold settle) |
 | `done` | Stream finished (`data: [DONE]`) | No |
 
 Example wire format:

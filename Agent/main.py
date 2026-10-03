@@ -23,7 +23,27 @@ from db.db_operations import (
     session_belongs_to_user,
 )
 from utils.llm import get_provider_models, with_provider_fallbacks
-from db.user_operations import create_user, get_user_by_username, verify_password
+from db.user_operations import (
+    FREE_QUESTION_CREDITS,
+    create_user,
+    get_user_by_id,
+    get_user_by_username,
+    get_user_credits,
+    is_valid_gmail,
+    normalize_gmail,
+    reserve_credits,
+    settle_usage,
+    verify_password,
+)
+from utils.usage import (
+    UsageAccumulator,
+    UsageCallbackHandler,
+    bind_usage,
+    credit_hold_amount,
+    min_credits_per_turn,
+    record_from_message,
+    tokens_per_credit,
+)
 from langchain.agents import create_agent
 from typing import Annotated, Any
 from contextlib import asynccontextmanager
@@ -323,19 +343,61 @@ def _langsmith_trace_url(run_id: uuid.UUID) -> str | None:
         return None
 
 
-def _new_run_config(session_id: str, user_id: str) -> tuple[dict, uuid.UUID, str | None]:
-    """Config for one graph turn, with a stable LangSmith run id."""
-    run_id = uuid.uuid4()
-    invoke_config = {
-        "run_id": run_id,
+def _new_run_config(
+    session_id: str,
+    user_id: str,
+    *,
+    run_id: uuid.UUID | None = None,
+    usage: UsageAccumulator | None = None,
+    purpose: str = "chat",
+) -> tuple[dict, uuid.UUID, str | None]:
+    """Config for one graph turn, with a stable LangSmith run id + usage callback."""
+    resolved_run_id = run_id or uuid.uuid4()
+    invoke_config: dict[str, Any] = {
+        "run_id": resolved_run_id,
         "configurable": {"thread_id": session_id, "user_id": user_id},
         "metadata": {
             "session_id": session_id,
             "user_id": user_id,
         },
-        "tags": ["chat"],
+        "tags": ["chat", purpose],
     }
-    return invoke_config, run_id, _langsmith_trace_url(run_id)
+    if usage is not None:
+        invoke_config["callbacks"] = [UsageCallbackHandler(usage, purpose=purpose)]
+    return invoke_config, resolved_run_id, _langsmith_trace_url(resolved_run_id)
+
+
+def _settle_turn(
+    *,
+    user_id: str,
+    session_id: str,
+    run_id: uuid.UUID,
+    usage: UsageAccumulator,
+    purpose: str,
+    turn_failed: bool,
+) -> dict:
+    """Settle the credit hold against measured provider tokens for this turn."""
+    try:
+        return settle_usage(
+            user_id,
+            run_id=run_id,
+            session_id=session_id,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            purpose=purpose,
+            turn_failed=turn_failed,
+        )
+    except Exception as settle_err:
+        print("settle_usage failed:", settle_err)
+        remaining = get_user_credits(user_id)
+        return {
+            "credits": remaining if remaining is not None else 0,
+            "credits_charged": 0,
+            "credits_held": 0,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+        }
 
 
 _NODE_STATUS = {
@@ -451,6 +513,19 @@ async def _stream_graph_parts(
         await worker_fut
 
 
+def _backfill_usage_from_messages(
+    messages: list,
+    usage: UsageAccumulator | None,
+    purpose: str,
+) -> None:
+    """If callbacks missed tokens, recover usage_metadata from AIMessages once."""
+    if usage is None or usage.total_tokens > 0:
+        return
+    for message in messages:
+        if isinstance(message, AIMessage):
+            record_from_message(message, purpose=purpose, accumulator=usage)
+
+
 async def _iter_graph_sse(
     graph_input: Any,
     invoke_config: dict,
@@ -459,6 +534,8 @@ async def _iter_graph_sse(
     fallback_query: str,
     run_id: uuid.UUID | None = None,
     trace_url: str | None = None,
+    usage: UsageAccumulator | None = None,
+    purpose: str = "chat",
 ):
     """Yield a status event when each graph node starts, then the final answer.
 
@@ -500,6 +577,8 @@ async def _iter_graph_sse(
         elif not _latest_assistant_text(messages):
             state_values = getattr(snapshot, "values", None) or {}
             messages = list(state_values.get("messages") or [])
+
+    _backfill_usage_from_messages(messages, usage, purpose)
 
     if interrupt_payload:
         yield _sse_event("message", _approval_message(interrupt_payload))
@@ -547,27 +626,49 @@ async def event_generator(
     combined_context: str,
     session_id: str,
     user_id: str,
+    run_id: uuid.UUID,
 ):
-    invoke_config, run_id, trace_url = _new_run_config(session_id, user_id)
-    try:
-        async for piece in _iter_graph_sse(
-            {
-                "messages": [{"role": "user", "content": user_input}],
-                "intent": "",
-                "combined_context": combined_context,
-            },
-            invoke_config,
-            session_id,
-            user_id,
-            user_input,
-            run_id=run_id,
-            trace_url=trace_url,
-        ):
-            yield piece
-    except Exception as e:
-        yield _sse_event("message", f"[error] {e}")
-    finally:
-        yield "event: done\ndata: [DONE]\n\n"
+    usage = UsageAccumulator()
+    invoke_config, run_id, trace_url = _new_run_config(
+        session_id,
+        user_id,
+        run_id=run_id,
+        usage=usage,
+        purpose="chat",
+    )
+    turn_failed = False
+    with bind_usage(usage):
+        try:
+            async for piece in _iter_graph_sse(
+                {
+                    "messages": [{"role": "user", "content": user_input}],
+                    "intent": "",
+                    "combined_context": combined_context,
+                },
+                invoke_config,
+                session_id,
+                user_id,
+                user_input,
+                run_id=run_id,
+                trace_url=trace_url,
+                usage=usage,
+                purpose="chat",
+            ):
+                yield piece
+        except Exception as e:
+            turn_failed = True
+            yield _sse_event("message", f"[error] {e}")
+        finally:
+            billing = _settle_turn(
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                usage=usage,
+                purpose="chat",
+                turn_failed=turn_failed,
+            )
+            yield _sse_event("credits", json.dumps(billing))
+            yield "event: done\ndata: [DONE]\n\n"
 
 
 @app.api_route(
@@ -596,6 +697,26 @@ async def chat(
         if not session_belongs_to_user(resolved_session_id, user_id):
             raise HTTPException(status_code=403, detail="Session not found")
 
+        run_id = uuid.uuid4()
+        remaining = reserve_credits(
+            user_id,
+            credit_hold_amount(),
+            run_id=run_id,
+            session_id=resolved_session_id,
+        )
+        if remaining is None:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "message": (
+                        "You don't have enough credits left. "
+                        "Please upgrade your plan to continue chatting."
+                    ),
+                    "credits": 0,
+                    "upgrade_required": True,
+                },
+            )
+
         combined_context = combine_messages(resolved_session_id)
         try:
             persist_chat_request(
@@ -608,9 +729,18 @@ async def chat(
             print("persist_chat_request failed:", persist_err)
 
         return StreamingResponse(
-            event_generator(user_message, combined_context, resolved_session_id, user_id),
+            event_generator(
+                user_message,
+                combined_context,
+                resolved_session_id,
+                user_id,
+                run_id,
+            ),
             media_type="text/event-stream",
-            headers=_SSE_HEADERS,
+            headers={
+                **_SSE_HEADERS,
+                "X-Credits-Remaining": str(remaining),
+            },
         )
     except HTTPException:
         raise
@@ -624,27 +754,33 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+
+def _auth_success_response(user: dict) -> dict:
+    access_token = create_access_token(
+        username=user["username"],
+        user_id=str(user["id"]),
+    )
+    if not access_token:
+        raise HTTPException(status_code=500, detail="Failed to generate access token")
+    session_id = str(uuid.uuid4())
+    create_session_for_user(str(user["id"]), session_id)
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "session_id": session_id,
+        "username": user["username"],
+        "credits": int(user.get("credits", 0)),
+    }
+
+
 @app.post("/login")
 def login(req: LoginRequest):
     try:
-        user = get_user_by_username(req.username)
+        username = normalize_gmail(req.username) if "@" in req.username else req.username.strip()
+        user = get_user_by_username(username)
         if not user or not verify_password(req.password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        access_token = create_access_token(
-            username=user["username"],
-            user_id=str(user["id"]),
-        )
-        if not access_token:
-            raise HTTPException(status_code=500, detail="Failed to generate access token")
-
-        session_id = str(uuid.uuid4())
-        create_session_for_user(str(user["id"]), session_id)
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "session_id": session_id,
-        }
+        return _auth_success_response(user)
     except HTTPException:
         raise
     except Exception as e:
@@ -654,26 +790,56 @@ def login(req: LoginRequest):
 @app.post("/register")
 def register(req: LoginRequest):
     try:
-        if get_user_by_username(req.username):
-            raise HTTPException(status_code=409, detail="Username already exists")
-        user = create_user(req.username, req.password)
-        access_token = create_access_token(
-            username=user["username"],
-            user_id=str(user["id"]),
-        )
-        if not access_token:
-            raise HTTPException(status_code=500, detail="Failed to generate access token")
-        session_id = str(uuid.uuid4())
-        create_session_for_user(str(user["id"]), session_id)
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "session_id": session_id,
-        }
+        email = normalize_gmail(req.username)
+        if not is_valid_gmail(email):
+            raise HTTPException(
+                status_code=400,
+                detail="Please register with a valid Gmail address (must end with @gmail.com).",
+            )
+        if len(req.password) < 6:
+            raise HTTPException(
+                status_code=400,
+                detail="Password must be at least 6 characters.",
+            )
+        if get_user_by_username(email):
+            raise HTTPException(status_code=409, detail="An account with this Gmail already exists.")
+        user = create_user(email, req.password, initial_credits=FREE_QUESTION_CREDITS)
+        return _auth_success_response(user)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/me")
+def get_me(token: Annotated[str, Depends(oauth2_scheme)]):
+    """Return the current user profile including remaining credits."""
+    payload = _verify_auth_payload(token)
+    user = get_user_by_id(payload["user_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {
+        "username": user["username"],
+        "credits": int(user["credits"]),
+        "free_tier_credits": FREE_QUESTION_CREDITS,
+        "tokens_per_credit": tokens_per_credit(),
+        "credit_hold_amount": credit_hold_amount(),
+        "min_credits_per_turn": min_credits_per_turn(),
+    }
+
+
+@app.get("/credits")
+def get_credits(token: Annotated[str, Depends(oauth2_scheme)]):
+    payload = _verify_auth_payload(token)
+    credits = get_user_credits(payload["user_id"])
+    if credits is None:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {
+        "credits": credits,
+        "tokens_per_credit": tokens_per_credit(),
+        "credit_hold_amount": credit_hold_amount(),
+        "min_credits_per_turn": min_credits_per_turn(),
+    }
 
 
 @app.get("/sessions")
@@ -750,25 +916,53 @@ async def _pending_approval_context(token: str, session_id: str) -> tuple[str, d
     return user_id, invoke_config
 
 
-async def _approval_event_generator(session_id: str, user_id: str, invoke_config: dict):
-    resume_config, run_id, trace_url = _new_run_config(session_id, user_id)
+async def _approval_event_generator(
+    session_id: str,
+    user_id: str,
+    invoke_config: dict,
+    run_id: uuid.UUID,
+):
+    usage = UsageAccumulator()
+    resume_config, run_id, trace_url = _new_run_config(
+        session_id,
+        user_id,
+        run_id=run_id,
+        usage=usage,
+        purpose="approve",
+    )
     # Keep checkpoint thread from the pending lookup; replace with traced config.
-    resume_config["configurable"] = invoke_config.get("configurable", resume_config["configurable"])
-    try:
-        async for piece in _iter_graph_sse(
-            Command(resume={"approved": True}),
-            resume_config,
-            session_id,
-            user_id,
-            "",
-            run_id=run_id,
-            trace_url=trace_url,
-        ):
-            yield piece
-    except Exception as e:
-        yield _sse_event("message", f"[error] {e}")
-    finally:
-        yield "event: done\ndata: [DONE]\n\n"
+    resume_config["configurable"] = invoke_config.get(
+        "configurable", resume_config["configurable"]
+    )
+    turn_failed = False
+    with bind_usage(usage):
+        try:
+            async for piece in _iter_graph_sse(
+                Command(resume={"approved": True}),
+                resume_config,
+                session_id,
+                user_id,
+                "",
+                run_id=run_id,
+                trace_url=trace_url,
+                usage=usage,
+                purpose="approve",
+            ):
+                yield piece
+        except Exception as e:
+            turn_failed = True
+            yield _sse_event("message", f"[error] {e}")
+        finally:
+            billing = _settle_turn(
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                usage=usage,
+                purpose="approve",
+                turn_failed=turn_failed,
+            )
+            yield _sse_event("credits", json.dumps(billing))
+            yield "event: done\ndata: [DONE]\n\n"
 
 
 @app.get("/approval/pending")
@@ -785,10 +979,32 @@ async def approve_pending(
     session_id: str,
 ):
     user_id, invoke_config = await _pending_approval_context(token, session_id)
+    run_id = uuid.uuid4()
+    remaining = reserve_credits(
+        user_id,
+        credit_hold_amount(),
+        run_id=run_id,
+        session_id=session_id,
+    )
+    if remaining is None:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": (
+                    "You don't have enough credits left. "
+                    "Please upgrade your plan to continue chatting."
+                ),
+                "credits": 0,
+                "upgrade_required": True,
+            },
+        )
     return StreamingResponse(
-        _approval_event_generator(session_id, user_id, invoke_config),
+        _approval_event_generator(session_id, user_id, invoke_config, run_id),
         media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        headers={
+            **_SSE_HEADERS,
+            "X-Credits-Remaining": str(remaining),
+        },
     )
 
 
@@ -806,10 +1022,32 @@ async def approve_pending_email(
     session_id: str,
 ):
     user_id, invoke_config = await _pending_approval_context(token, session_id)
+    run_id = uuid.uuid4()
+    remaining = reserve_credits(
+        user_id,
+        credit_hold_amount(),
+        run_id=run_id,
+        session_id=session_id,
+    )
+    if remaining is None:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": (
+                    "You don't have enough credits left. "
+                    "Please upgrade your plan to continue chatting."
+                ),
+                "credits": 0,
+                "upgrade_required": True,
+            },
+        )
     return StreamingResponse(
-        _approval_event_generator(session_id, user_id, invoke_config),
+        _approval_event_generator(session_id, user_id, invoke_config, run_id),
         media_type="text/event-stream",
-        headers=_SSE_HEADERS,
+        headers={
+            **_SSE_HEADERS,
+            "X-Credits-Remaining": str(remaining),
+        },
     )
 
 

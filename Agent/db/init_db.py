@@ -41,7 +41,8 @@ def init_db() -> None:
         conn.commit()
 
     if not get_user_by_username(DEFAULT_ADMIN_USERNAME):
-        create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        # Seed admin with a large credit balance for local development.
+        create_user(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD, initial_credits=30)
         print(f"Created default user '{DEFAULT_ADMIN_USERNAME}'.")
     else:
         print(f"User '{DEFAULT_ADMIN_USERNAME}' already exists.")

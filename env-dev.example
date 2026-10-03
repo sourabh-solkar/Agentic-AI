@@ -24,6 +24,15 @@ DATABASE_URL=postgresql://postgres:@localhost:5432/sessions
 DEFAULT_ADMIN_USERNAME=admin
 DEFAULT_ADMIN_PASSWORD=admin
 
+# Free-tier credits granted on Gmail registration (token-metered after each turn)
+FREE_QUESTION_CREDITS=30
+
+# Token → credit billing (provider usage_metadata is the source of truth)
+# credits_charged = max(MIN_CREDITS_PER_TURN, ceil(total_tokens / TOKENS_PER_CREDIT))
+TOKENS_PER_CREDIT=1000
+CREDIT_HOLD_AMOUNT=1
+MIN_CREDITS_PER_TURN=1
+
 # Free LLM providers (fallback chain). Set any combination of keys.
 # Order: FREE_LLM_ORDER=gemini,groq,grok,openrouter,cerebras
 GEMINI_API_KEY=<your-gemini-api-key>

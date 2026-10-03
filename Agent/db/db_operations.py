@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from dotenv import load_dotenv
 
 from utils.llm import get_chat_llm
+from utils.usage import record_from_message
 
 load_dotenv()
 
@@ -86,6 +87,10 @@ def update_rolling_summary(existing_summary: str, role: str, content: str) -> st
     )
 
     response = chat_llm.invoke([HumanMessage(content=prompt)])
+    try:
+        record_from_message(response, purpose="summary")
+    except Exception as meter_err:
+        print("summary usage metering skipped:", meter_err)
     return response.content
 
 
@@ -98,6 +103,10 @@ def _summarize_latest_turn(existing_summary: str, user_content: str, assistant_c
         "Task: Write an updated, concise single-paragraph summary incorporating this exchange."
     )
     response = chat_llm.invoke([HumanMessage(content=prompt)])
+    try:
+        record_from_message(response, purpose="summary")
+    except Exception as meter_err:
+        print("summary usage metering skipped:", meter_err)
     return response.content
 
 
