@@ -1,17 +1,17 @@
-# Flexible pins so pip can resolve LangChain / LangGraph on Render.
-fastapi>=0.136.0,<1
-fastapi-limiter>=0.2.0,<1
-langchain>=1.2.0,<2
-langchain-core>=1.6.0,<2
-langchain-google-genai>=4.2.0,<5
-langchain-openai>=1.6.0,<2
-langchain-postgres>=0.0.14,<1
-langgraph>=1.1.0,<2
-langgraph-checkpoint-postgres>=2.0.0,<4
-psycopg[binary,pool]>=3.3.0,<4
-pydantic>=2.0.0,<3
-PyJWT>=2.12.0,<3
-pyrate-limiter>=4.0.0,<5
-python-dotenv>=1.0.0,<2
-bcrypt>=4.0.0,<5
-uvicorn[standard]>=0.45.0,<1
+﻿# Resolved set verified in a clean venv (no langchain-postgres — unused by Agent).
+# Pins avoid pip ResolutionImpossible on Render.
+fastapi==0.142.2
+fastapi-limiter==0.2.0
+langchain==1.4.3
+langchain-core==1.6.6
+langchain-google-genai==4.4.0
+langchain-openai==1.6.7
+langgraph==1.2.12
+langgraph-checkpoint-postgres==3.1.2
+psycopg[binary,pool]==3.3.6
+pydantic==2.13.5
+PyJWT==2.15.1
+pyrate-limiter==4.5.0
+python-dotenv==1.2.4
+bcrypt==5.0.0
+uvicorn[standard]==0.54.0
