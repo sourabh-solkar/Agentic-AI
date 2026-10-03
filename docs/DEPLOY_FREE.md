@@ -23,7 +23,7 @@ Do **not** commit `.env`.
 ## 1. Deploy Agent API on Render
 
 1. Sign in at [dashboard.render.com](https://dashboard.render.com) with GitHub.
-2. **New** → **Blueprint** → select `jhm164/Agentic-AI` (or your fork) → branch with `render.yaml`.
+2. **New** → **Blueprint** → select `sourabh-solkar/Agentic-AI` (GitHub) → branch `context-try`.
    - Or **New** → **Web Service** → same repo:
      - **Root Directory:** `Agent`
      - **Runtime:** Python 3
@@ -51,7 +51,7 @@ Free tier **spins down** after idle; the first request after sleep can take ~30�
 ## 2. Deploy UI on Streamlit Community Cloud
 
 1. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**.
-2. Repo: `jhm164/Agentic-AI`, branch matching your push.
+2. Repo: `sourabh-solkar/Agentic-AI`, branch `context-try`.
 3. **Main file path:** `UI/app.py`
 4. **Advanced settings → Secrets** (TOML):
 
