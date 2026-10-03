@@ -1,13 +1,13 @@
-import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
-from streamlit_javascript import st_javascript
+from streamlit_cookies_controller import CookieController
 
 _FASTAPI_HOST = os.getenv("FASTAPI_HOST", "127.0.0.1")
 _FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "9005"))
@@ -21,35 +21,58 @@ FASTAPI_APPROVAL_APPROVE_URL = f"{_FASTAPI_BASE_URL}/approval/approve"
 FASTAPI_EMAIL_PENDING_URL = FASTAPI_APPROVAL_PENDING_URL
 FASTAPI_EMAIL_APPROVE_URL = FASTAPI_APPROVAL_APPROVE_URL
 
-ACCESS_TOKEN_LOCAL_STORAGE_KEY = "access_token"
-SESSION_ID_LOCAL_STORAGE_KEY = "session_id"
+ACCESS_TOKEN_COOKIE = "access_token"
+SESSION_ID_COOKIE = "session_id"
+AUTH_COOKIES_STATE_KEY = "auth_cookies"
+AUTH_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 
-def _local_storage_js() -> str:
-    """Target the main Streamlit page localStorage, not the component iframe."""
-    return "(() => { try { return window.top.localStorage; } catch (e) { return localStorage; } })()"
+def _ensure_cookie_dict(cookies: CookieController) -> dict:
+    """CookieController may hold None before hydration; never mutate the widget key."""
+    raw = getattr(cookies, "_CookieController__cookies", None)
+    if isinstance(raw, dict):
+        return raw
+    empty: dict = {}
+    cookies._CookieController__cookies = empty
+    return empty
 
 
-def _browser_persist_auth(
+def _cookie_controller() -> CookieController:
+    """Create the cookie controller. Must run every script pass so it stays mounted."""
+    controller = CookieController(key=AUTH_COOKIES_STATE_KEY)
+    _ensure_cookie_dict(controller)
+    return controller
+
+
+def _cookie_get(cookies: CookieController, name: str):
+    """Read a cookie without raising when the controller cache is not ready."""
+    return _ensure_cookie_dict(cookies).get(name)
+
+
+def _persist_auth(
+    cookies: CookieController,
     access_token: str | None = None,
     session_id: str | None = None,
 ) -> None:
-    """Write or clear auth credentials in the browser's localStorage."""
-    store = _local_storage_js()
-    token_key = json.dumps(ACCESS_TOKEN_LOCAL_STORAGE_KEY)
-    session_key = json.dumps(SESSION_ID_LOCAL_STORAGE_KEY)
+    """Write or clear auth credentials in browser cookies."""
+    _ensure_cookie_dict(cookies)
 
+    expires = datetime.now() + timedelta(seconds=AUTH_COOKIE_MAX_AGE_SECONDS)
+    common = {
+        "max_age": AUTH_COOKIE_MAX_AGE_SECONDS,
+        "expires": expires,
+        "same_site": "lax",
+        "path": "/",
+    }
     if access_token:
-        token_js = f"{store}.setItem({token_key}, {json.dumps(access_token)});"
+        cookies.set(ACCESS_TOKEN_COOKIE, access_token, **common)
     else:
-        token_js = f"{store}.removeItem({token_key});"
+        cookies.remove(ACCESS_TOKEN_COOKIE)
 
     if session_id:
-        session_js = f"{store}.setItem({session_key}, {json.dumps(session_id)});"
+        cookies.set(SESSION_ID_COOKIE, session_id, **common)
     else:
-        session_js = f"{store}.removeItem({session_key});"
-
-    components.html(f"<script>{token_js}{session_js}</script>", height=0)
+        cookies.remove(SESSION_ID_COOKIE)
 
 
 def _clear_auth_state() -> None:
@@ -58,7 +81,6 @@ def _clear_auth_state() -> None:
     st.session_state.messages = []
     st.session_state.sessions_list = []
     st.session_state.approval_requested = False
-    st.session_state._auth_persisted = False
 
 
 def _auth_headers() -> dict[str, str]:
@@ -114,16 +136,21 @@ def delete_session(session_id: str) -> bool:
         return False
 
 
-def _apply_auth(access_token: str, session_id: str | None = None) -> bool:
-    """Validate token with the API and populate session state."""
+def _apply_auth(access_token: str, session_id: str | None = None) -> str:
+    """Validate token with the API and populate session state.
+
+    Returns "ok", "invalid" (clear stored token), or "unavailable" (keep token).
+    """
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
         response = requests.get(FASTAPI_SESSIONS_URL, headers=headers, timeout=15)
     except requests.RequestException:
-        return False
+        return "unavailable"
 
+    if response.status_code in (401, 403):
+        return "invalid"
     if response.status_code != 200:
-        return False
+        return "unavailable"
 
     st.session_state.access_token = access_token
     st.session_state.sessions_list = response.json().get("sessions", [])
@@ -142,58 +169,38 @@ def _apply_auth(access_token: str, session_id: str | None = None) -> bool:
         load_session_messages(resolved_session_id) if resolved_session_id else []
     )
     st.session_state.approval_requested = False
-    st.session_state._auth_persisted = False
-    return True
+    return "ok"
 
 
-def _parse_auth_storage(stored) -> dict | None:
-    if stored is None:
-        return None
-    if isinstance(stored, dict):
-        return stored
-    if isinstance(stored, str):
-        try:
-            parsed = json.loads(stored)
-        except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
-
-
-def _restore_auth_from_browser() -> None:
-    """On page load, restore login from localStorage if a valid token exists."""
+def _restore_auth_from_cookies(cookies: CookieController) -> None:
+    """On page load, restore login from cookies if a valid token exists."""
     if st.session_state.access_token is not None:
         return
     if st.session_state.get("_auth_restore_done"):
         return
 
-    stored = st_javascript(
-        f"""
-        ({{
-            access_token: localStorage.getItem({json.dumps(ACCESS_TOKEN_LOCAL_STORAGE_KEY)}),
-            session_id: localStorage.getItem({json.dumps(SESSION_ID_LOCAL_STORAGE_KEY)})
-        }})
-        """,
-        key="auth_restore",
-    )
+    # CookieController loads browser cookies asynchronously. Give the component
+    # time to report values, then re-read on a fresh run.
+    passes = st.session_state.get("_cookie_hydrate_passes", 0)
+    access_token = _cookie_get(cookies, ACCESS_TOKEN_COOKIE)
+    session_id = _cookie_get(cookies, SESSION_ID_COOKIE)
 
-    if stored is None:
-        return
+    if not access_token and passes < 2:
+        st.session_state._cookie_hydrate_passes = passes + 1
+        # Wall-clock wait so the browser can send cookies before the next run.
+        time.sleep(0.8)
+        st.rerun()
 
     st.session_state._auth_restore_done = True
 
-    payload = _parse_auth_storage(stored)
-    if not payload:
-        return
-
-    access_token = payload.get("access_token")
     if not access_token:
         return
 
-    if _apply_auth(access_token, payload.get("session_id")):
+    result = _apply_auth(access_token, session_id)
+    if result == "ok":
         st.rerun()
-
-    _browser_persist_auth(None, None)
+    elif result == "invalid":
+        _persist_auth(cookies, None, None)
 
 
 if "access_token" not in st.session_state:
@@ -206,6 +213,9 @@ if "approval_requested" not in st.session_state:
     st.session_state.approval_requested = False
 if "sessions_list" not in st.session_state:
     st.session_state.sessions_list = []
+
+# Keep the cookie component mounted on every run.
+_cookies = _cookie_controller()
 
 
 def _read_sse(resp, on_status, on_message) -> str:
@@ -263,12 +273,14 @@ def login():
             data = response.json()
             access_token = data.get("access_token")
             session_id = data.get("session_id")
-            if not access_token or not _apply_auth(access_token, session_id):
+            if not access_token or _apply_auth(access_token, session_id) != "ok":
                 st.error("Login succeeded but session could not be restored.")
                 return
-            _browser_persist_auth(access_token, st.session_state.session_id)
-            st.session_state._auth_persisted = True
+            _persist_auth(_cookies, access_token, st.session_state.session_id)
+            st.session_state._auth_restore_done = True
             st.success("Logged in successfully!" if login_clicked else "Account created!")
+            # Give the cookie component time to write before rerun.
+            time.sleep(0.4)
             st.rerun()
         else:
             detail = response.json().get("detail") if response.headers.get("content-type", "").startswith("application/json") else response.text
@@ -305,7 +317,11 @@ def render_session_sidebar() -> None:
             if new_session_id:
                 st.session_state.session_id = new_session_id
                 st.session_state.messages = []
-                st.session_state._auth_persisted = False
+                _persist_auth(
+                    _cookies,
+                    st.session_state.access_token,
+                    new_session_id,
+                )
                 st.session_state.sessions_list = fetch_sessions()
                 st.rerun()
             else:
@@ -329,7 +345,11 @@ def render_session_sidebar() -> None:
                 if st.button(label, key=f"session_{session_id}", use_container_width=True):
                     st.session_state.session_id = session_id
                     st.session_state.messages = load_session_messages(session_id)
-                    st.session_state._auth_persisted = False
+                    _persist_auth(
+                        _cookies,
+                        st.session_state.access_token,
+                        session_id,
+                    )
                     st.session_state.approval_requested = False
                     st.rerun()
             with delete_col:
@@ -343,30 +363,27 @@ def render_session_sidebar() -> None:
                                 next_id = st.session_state.sessions_list[0]["session_id"]
                                 st.session_state.session_id = next_id
                                 st.session_state.messages = load_session_messages(next_id)
-                        st.session_state._auth_persisted = False
+                        _persist_auth(
+                            _cookies,
+                            st.session_state.access_token,
+                            st.session_state.session_id,
+                        )
                         st.rerun()
                     else:
                         st.error("Could not delete chat.")
 
 
 def chat_interface():
-    if st.session_state.access_token and not st.session_state.get("_auth_persisted"):
-        _browser_persist_auth(
-            st.session_state.access_token,
-            st.session_state.session_id,
-        )
-        st.session_state._auth_persisted = True
-
     render_session_sidebar()
 
     st.title("Chat with AI")
     st.caption(f"Backend: `{FASTAPI_CHAT_URL}`")
 
     if st.button("Logout"):
-        _browser_persist_auth(None, None)
+        _persist_auth(_cookies, None, None)
         _clear_auth_state()
-
-        st.session_state._auth_restore_done = False
+        st.session_state._auth_restore_done = True
+        time.sleep(0.3)
         st.rerun()
 
     if not st.session_state.session_id:
@@ -546,11 +563,12 @@ def chat_interface():
         except urllib.error.HTTPError as e:
             run_status.update(label="Request failed", state="error")
             if e.code in (401, 403):
-                _browser_persist_auth(None, None)
+                _persist_auth(_cookies, None, None)
                 _clear_auth_state()
-                st.session_state._auth_restore_done = False
+                st.session_state._auth_restore_done = True
                 full_response = "Session expired. Please log in again."
                 st.warning(full_response)
+                time.sleep(0.3)
                 st.rerun()
             else:
                 full_response = f"HTTP error from API: {e.code} — {e.read().decode(errors='replace')}"
@@ -571,7 +589,7 @@ def chat_interface():
         st.rerun()
 
 
-_restore_auth_from_browser()
+_restore_auth_from_cookies(_cookies)
 
 if st.session_state.access_token is None:
     if not st.session_state.get("_auth_restore_done"):
