@@ -1,16 +1,17 @@
-fastapi==0.141.1
-fastapi_limiter==0.2.0
-langchain==1.3.15
-langchain_core==1.5.5
-langchain_google_genai==4.3.4
-langchain-openai>=1.6.0
-langchain_postgres==0.0.17
-langgraph==1.2.11
-langgraph-checkpoint-postgres>=2.0.0
-psycopg[binary,pool]==3.3.4
-pydantic==2.13.4
-PyJWT==2.13.0
-pyrate_limiter==4.4.0
-python-dotenv==1.2.2
-bcrypt>=4.0.0
-uvicorn==0.52.3
+﻿# Resolved set verified in a clean venv (no langchain-postgres — unused by Agent).
+# Pins avoid pip ResolutionImpossible on Render.
+fastapi==0.142.2
+fastapi-limiter==0.2.0
+langchain==1.4.3
+langchain-core==1.6.6
+langchain-google-genai==4.4.0
+langchain-openai==1.6.7
+langgraph==1.2.12
+langgraph-checkpoint-postgres==3.1.2
+psycopg[binary,pool]==3.3.6
+pydantic==2.13.5
+PyJWT==2.15.1
+pyrate-limiter==4.5.0
+python-dotenv==1.2.4
+bcrypt==5.0.0
+uvicorn[standard]==0.54.0
