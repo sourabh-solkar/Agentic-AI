@@ -1,13 +1,12 @@
-# Render Blueprint — Agent API (connect Neon + set secrets in the dashboard).
+# Render Blueprint — Agent API (repo-root build; no Root Directory required)
 # https://render.com/docs/blueprint-spec
 services:
   - type: web
     name: villa-assistant-api
     runtime: python
     plan: free
-    rootDir: Agent
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r Agent/requirements.txt
+    startCommand: bash -c "cd Agent && uvicorn main:app --host 0.0.0.0 --port $PORT"
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION

@@ -24,12 +24,14 @@ Do **not** commit `.env`.
 
 1. Sign in at [dashboard.render.com](https://dashboard.render.com) with GitHub.
 2. **New** → **Blueprint** → select `sourabh-solkar/Agentic-AI` (GitHub) → branch `context-try`.
-   - Or **New** → **Web Service** → same repo:
-     - **Root Directory:** `Agent`
+   - Or **New** → **Web Service** → same repo → branch `context-try`:
+     - **Root Directory:** leave **empty** (repo root)
      - **Runtime:** Python 3
-     - **Build:** `pip install -r requirements.txt`
-     - **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+     - **Build:** `pip install -r Agent/requirements.txt`
+     - **Start:** `bash -c "cd Agent && uvicorn main:app --host 0.0.0.0 --port $PORT"`
      - **Health check path:** `/health`
+
+   If you already created the service and the build failed on missing `requirements.txt`, open **Settings → Build & Deploy** and set Build/Start exactly as above (clear Root Directory if it was set to something else).
 3. Set **Environment** (copy from local `.env`, never paste into git):
 
    | Key | Notes |
