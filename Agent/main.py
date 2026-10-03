@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import sys
+from datetime import datetime, timezone
 
 # psycopg async cannot use Windows ProactorEventLoop; uvicorn defaults to it.
 if sys.platform == "win32":
@@ -289,6 +291,42 @@ def _sse_event(event: str, text: str) -> str:
     return f"event: {event}\n{data}\n"
 
 
+def _langsmith_trace_url(run_id: uuid.UUID) -> str | None:
+    """Build a LangSmith UI URL for this chat turn's root run."""
+    try:
+        from langsmith import Client
+        from langsmith.schemas import Run
+
+        client = Client()
+        run = Run(
+            id=run_id,
+            name="chat_turn",
+            run_type="chain",
+            inputs={},
+            start_time=datetime.now(timezone.utc),
+        )
+        project_name = os.getenv("LANGSMITH_PROJECT") or None
+        return client.get_run_url(run=run, project_name=project_name)
+    except Exception as err:
+        print("langsmith trace url failed:", err)
+        return None
+
+
+def _new_run_config(session_id: str, user_id: str) -> tuple[dict, uuid.UUID, str | None]:
+    """Config for one graph turn, with a stable LangSmith run id."""
+    run_id = uuid.uuid4()
+    invoke_config = {
+        "run_id": run_id,
+        "configurable": {"thread_id": session_id, "user_id": user_id},
+        "metadata": {
+            "session_id": session_id,
+            "user_id": user_id,
+        },
+        "tags": ["chat"],
+    }
+    return invoke_config, run_id, _langsmith_trace_url(run_id)
+
+
 _NODE_STATUS = {
     "classify": "Classifying your request",
     "inject_context": "Loading conversation context",
@@ -408,17 +446,21 @@ async def _iter_graph_sse(
     session_id: str,
     user_id: str,
     fallback_query: str,
+    run_id: uuid.UUID | None = None,
+    trace_url: str | None = None,
 ):
     """Yield a status event when each graph node starts, then the final answer.
 
     `tasks` events are queued before a node runs, so the UI can show the step
     while that node is still working. The assistant text is a separate `message`
-    event and is the only part persisted.
+    event and is the only part persisted. A `trace` event carries the LangSmith
+    link for this specific chat turn.
     """
     graph = _get_router_graph()
     yield _sse_event("status", "Starting")
     messages: list = []
     interrupt_payload: dict[str, str] | None = None
+    trace_id = str(run_id) if run_id else None
 
     async for part in _stream_graph_parts(graph, graph_input, invoke_config):
         if not isinstance(part, tuple) or len(part) != 2:
@@ -450,14 +492,43 @@ async def _iter_graph_sse(
 
     if interrupt_payload:
         yield _sse_event("message", _approval_message(interrupt_payload))
+        if trace_id or trace_url:
+            yield _sse_event(
+                "trace",
+                json.dumps(
+                    {
+                        "trace_id": trace_id,
+                        "trace_url": trace_url,
+                        "message_id": None,
+                    }
+                ),
+            )
         return
 
     assistant_text = _latest_assistant_text(messages) or "I could not generate a response."
+    saved = None
     try:
-        append_assistant_message(session_id, assistant_text, user_id=user_id)
+        saved = append_assistant_message(
+            session_id,
+            assistant_text,
+            user_id=user_id,
+            trace_id=trace_id,
+            trace_url=trace_url,
+        )
     except Exception as persist_err:
         print("append_assistant_message failed:", persist_err)
     yield _sse_event("message", assistant_text)
+    if trace_id or trace_url or saved:
+        yield _sse_event(
+            "trace",
+            json.dumps(
+                {
+                    "trace_id": trace_id,
+                    "trace_url": trace_url,
+                    "message_id": saved["id"] if saved else None,
+                }
+            ),
+        )
 
 
 async def event_generator(
@@ -466,7 +537,7 @@ async def event_generator(
     session_id: str,
     user_id: str,
 ):
-    invoke_config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
+    invoke_config, run_id, trace_url = _new_run_config(session_id, user_id)
     try:
         async for piece in _iter_graph_sse(
             {
@@ -478,6 +549,8 @@ async def event_generator(
             session_id,
             user_id,
             user_input,
+            run_id=run_id,
+            trace_url=trace_url,
         ):
             yield piece
     except Exception as e:
@@ -657,6 +730,7 @@ async def _pending_approval_context(token: str, session_id: str) -> tuple[str, d
         raise HTTPException(status_code=403, detail="Session not found")
 
     graph = _get_router_graph()
+    # State lookup only needs thread/user; tracing run_id is added on approve resume.
     invoke_config = {"configurable": {"thread_id": session_id, "user_id": user_id}}
     snapshot = await graph.aget_state(invoke_config)
     pending = _sanitize_approval_payload(_pending_from_snapshot(snapshot))
@@ -666,13 +740,18 @@ async def _pending_approval_context(token: str, session_id: str) -> tuple[str, d
 
 
 async def _approval_event_generator(session_id: str, user_id: str, invoke_config: dict):
+    resume_config, run_id, trace_url = _new_run_config(session_id, user_id)
+    # Keep checkpoint thread from the pending lookup; replace with traced config.
+    resume_config["configurable"] = invoke_config.get("configurable", resume_config["configurable"])
     try:
         async for piece in _iter_graph_sse(
             Command(resume={"approved": True}),
-            invoke_config,
+            resume_config,
             session_id,
             user_id,
             "",
+            run_id=run_id,
+            trace_url=trace_url,
         ):
             yield piece
     except Exception as e:

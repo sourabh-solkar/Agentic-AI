@@ -223,10 +223,10 @@ def get_messages_for_session(session_id: str) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT role, content, created_at
+                SELECT id, role, content, trace_id, trace_url, created_at
                 FROM messages
                 WHERE session_id = %s AND role IN ('user', 'assistant')
-                ORDER BY created_at ASC;
+                ORDER BY created_at ASC, id ASC;
                 """,
                 (session_id,),
             )
@@ -288,22 +288,35 @@ def persist_chat_request(
         conn.commit()
 
 
-def append_assistant_message(session_id: str, assistant_content: str, user_id: str | None = None) -> None:
+def append_assistant_message(
+    session_id: str,
+    assistant_content: str,
+    user_id: str | None = None,
+    trace_id: str | None = None,
+    trace_url: str | None = None,
+) -> dict | None:
     """Persist the assistant reply after the agent finishes."""
     ensure_session(session_id, user_id)
     touch_session(session_id)
+    row = None
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO messages (session_id, role, content) VALUES (%s, %s, %s);",
-                (session_id, "assistant", assistant_content),
+                """
+                INSERT INTO messages (session_id, role, content, trace_id, trace_url)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, role, content, trace_id, trace_url, created_at;
+                """,
+                (session_id, "assistant", assistant_content, trace_id, trace_url),
             )
+            row = cur.fetchone()
         conn.commit()
     try:
         refresh_session_summary(session_id)
         trim_messages_to_window(session_id)
     except Exception as err:
         print("refresh_session_summary failed:", err)
+    return row
 
 def combine_messages(session_id: str) -> str:
     with get_db_connection() as conn:

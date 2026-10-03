@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'context')),
     content TEXT NOT NULL,
+    trace_id TEXT,
+    trace_url TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -44,6 +46,10 @@ ALTER TABLE sessions ALTER COLUMN created_at SET DEFAULT NOW();
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 UPDATE sessions SET updated_at = NOW() WHERE updated_at IS NULL;
 ALTER TABLE sessions ALTER COLUMN updated_at SET DEFAULT NOW();
+
+-- Upgrade older databases with optional LangSmith trace fields on messages.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS trace_id TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS trace_url TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user_updated ON sessions(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at ASC);

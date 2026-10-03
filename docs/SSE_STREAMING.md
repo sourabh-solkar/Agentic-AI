@@ -28,6 +28,7 @@ Async runners below 3.11 drop the runnable config `contextvars` that `interrupt(
 |-------|---------|------------|
 | `status` | Live step label while a node is working | No |
 | `message` | Final assistant text (or approval prompt / `[error] …`) | Yes (assistant text only) |
+| `trace` | JSON with `trace_id`, `trace_url`, `message_id` for this turn | Yes (`trace_*` on the assistant row) |
 | `done` | Stream finished (`data: [DONE]`) | No |
 
 Example wire format:
@@ -41,6 +42,9 @@ data: Checking availability
 
 event: message
 data: Here are the open villas…
+
+event: trace
+data: {"trace_id":"…","trace_url":"https://smith.langchain.com/…","message_id":42}
 
 event: done
 data: [DONE]

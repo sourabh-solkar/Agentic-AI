@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import urllib.error
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_cookies_controller import CookieController
 
 _FASTAPI_HOST = os.getenv("FASTAPI_HOST", "127.0.0.1")
@@ -106,7 +108,14 @@ def load_session_messages(session_id: str) -> list[dict]:
         )
         if response.status_code == 200:
             return [
-                {"role": msg["role"], "content": msg["content"]}
+                {
+                    "id": msg.get("id"),
+                    "role": msg["role"],
+                    "content": msg["content"],
+                    "trace_id": msg.get("trace_id"),
+                    "trace_url": msg.get("trace_url"),
+                    "created_at": msg.get("created_at"),
+                }
                 for msg in response.json().get("messages", [])
             ]
     except requests.RequestException:
@@ -218,9 +227,10 @@ if "sessions_list" not in st.session_state:
 _cookies = _cookie_controller()
 
 
-def _read_sse(resp, on_status, on_message) -> str:
+def _read_sse(resp, on_status, on_message, on_trace=None) -> tuple[str, dict | None]:
     """Read a graph SSE stream. Status lines are live steps; message lines are the answer."""
     full_response = ""
+    trace_meta = None
     current_event = "message"
     for raw_line in resp:
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -245,9 +255,62 @@ def _read_sse(resp, on_status, on_message) -> str:
             on_status(data)
             continue
 
+        if current_event == "trace":
+            try:
+                trace_meta = json.loads(data)
+            except json.JSONDecodeError:
+                trace_meta = {"trace_url": data}
+            if on_trace:
+                on_trace(trace_meta)
+            continue
+
         full_response += data + "\n"
         on_message(full_response)
-    return full_response
+    return full_response, trace_meta
+
+
+def _focus_message_id() -> int | None:
+    raw = st.query_params.get("msg")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _message_permalink(message_id: int | None) -> str | None:
+    if not message_id:
+        return None
+    session_id = st.session_state.session_id or ""
+    return f"?session={session_id}&msg={message_id}"
+
+
+def _render_chat_message(message: dict, *, focused: bool = False) -> None:
+    role = message.get("role", "assistant")
+    content = message.get("content") or ""
+    message_id = message.get("id")
+    trace_url = message.get("trace_url")
+    anchor = f"msg-{message_id}" if message_id else None
+
+    with st.chat_message(role):
+        if anchor:
+            st.markdown(
+                f'<div id="{anchor}"></div>',
+                unsafe_allow_html=True,
+            )
+        if focused:
+            st.info("Focused message")
+        st.markdown(content)
+
+        meta_bits: list[str] = []
+        if role == "assistant" and trace_url:
+            meta_bits.append(f"[View trace]({trace_url})")
+        permalink = _message_permalink(message_id)
+        if permalink:
+            meta_bits.append(f"[Link to message]({permalink})")
+        if meta_bits:
+            st.caption(" · ".join(meta_bits))
 
 
 def login():
@@ -310,9 +373,10 @@ def _session_label(session: dict) -> str:
 
 def render_session_sidebar() -> None:
     with st.sidebar:
-        st.header("Chats")
+        st.markdown("### Chats")
+        st.caption("Your conversations in this account.")
 
-        if st.button("+ New chat", key="new_chat_btn", use_container_width=True):
+        if st.button("New chat", key="new_chat_btn", use_container_width=True, type="primary"):
             new_session_id = create_new_session()
             if new_session_id:
                 st.session_state.session_id = new_session_id
@@ -376,15 +440,27 @@ def render_session_sidebar() -> None:
 def chat_interface():
     render_session_sidebar()
 
-    st.title("Chat with AI")
-    st.caption(f"Backend: `{FASTAPI_CHAT_URL}`")
+    # Honor deep links like ?session=<id>&msg=<message_id>
+    qp_session = st.query_params.get("session")
+    if qp_session and qp_session != st.session_state.session_id:
+        session_ids = {s["session_id"] for s in fetch_sessions()}
+        if qp_session in session_ids:
+            st.session_state.session_id = qp_session
+            st.session_state.messages = load_session_messages(qp_session)
+            st.session_state.approval_requested = False
 
-    if st.button("Logout"):
-        _persist_auth(_cookies, None, None)
-        _clear_auth_state()
-        st.session_state._auth_restore_done = True
-        time.sleep(0.3)
-        st.rerun()
+    title_col, logout_col = st.columns([6, 1])
+    with title_col:
+        st.title("Villa assistant")
+        st.caption("Ask about availability, bookings, or general questions.")
+    with logout_col:
+        st.write("")
+        if st.button("Logout", use_container_width=True):
+            _persist_auth(_cookies, None, None)
+            _clear_auth_state()
+            st.session_state._auth_restore_done = True
+            time.sleep(0.3)
+            st.rerun()
 
     if not st.session_state.session_id:
         st.info("Select a chat from the sidebar or create a new one.")
@@ -411,7 +487,7 @@ def chat_interface():
         st.session_state.approval_requested = True
 
     if pending_fetch_error:
-        st.info(f"Approval status unavailable: {pending_fetch_error}")
+        st.caption(f"Approval status unavailable: {pending_fetch_error}")
 
     need_approval_ui = st.session_state.approval_requested
 
@@ -467,6 +543,7 @@ def chat_interface():
                 run_status = st.status("Resuming…", expanded=True)
                 message_placeholder = st.empty()
                 resumed_message = ""
+                trace_meta = None
                 approve_url = (
                     f"{FASTAPI_APPROVAL_APPROVE_URL}?"
                     + urllib.parse.urlencode(
@@ -482,7 +559,7 @@ def chat_interface():
                 approve_ok = False
                 try:
                     with urllib.request.urlopen(approve_request, timeout=120) as resp:
-                        resumed_message = _read_sse(
+                        resumed_message, trace_meta = _read_sse(
                             resp,
                             on_status=lambda step: (
                                 run_status.write(step),
@@ -511,18 +588,41 @@ def chat_interface():
                 if approve_ok:
                     if resumed_message.strip():
                         st.session_state.messages.append(
-                            {"role": "assistant", "content": resumed_message}
+                            {
+                                "id": (trace_meta or {}).get("message_id"),
+                                "role": "assistant",
+                                "content": resumed_message,
+                                "trace_id": (trace_meta or {}).get("trace_id"),
+                                "trace_url": (trace_meta or {}).get("trace_url"),
+                            }
                         )
                     st.session_state.approval_requested = (
                         "[APPROVAL REQUIRED]" in resumed_message
                     )
                     st.rerun()
 
+    focus_id = _focus_message_id()
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+        _render_chat_message(
+            message,
+            focused=bool(focus_id and message.get("id") == focus_id),
+        )
 
-    if not (prompt := st.chat_input("Type your message here...")):
+    if focus_id:
+        components.html(
+            f"""
+            <script>
+            const doc = window.parent.document;
+            const el = doc.getElementById("msg-{focus_id}");
+            if (el) {{
+              el.scrollIntoView({{ behavior: "smooth", block: "center" }});
+            }}
+            </script>
+            """,
+            height=0,
+        )
+
+    if not (prompt := st.chat_input("Ask about villas, dates, or bookings…")):
         return
 
     with st.chat_message("user"):
@@ -533,7 +633,9 @@ def chat_interface():
     with st.chat_message("assistant"):
         run_status = st.status("Working…", expanded=True)
         message_placeholder = st.empty()
+        trace_placeholder = st.empty()
         full_response = ""
+        trace_meta = None
         query = urllib.parse.urlencode({
             "message": prompt,
             "session_id": st.session_state.session_id or "",
@@ -546,7 +648,7 @@ def chat_interface():
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as resp:
-                full_response = _read_sse(
+                full_response, trace_meta = _read_sse(
                     resp,
                     on_status=lambda step: (
                         run_status.write(step),
@@ -554,6 +656,13 @@ def chat_interface():
                     ),
                     on_message=lambda text: message_placeholder.markdown(
                         text.rstrip("\n") + "▌"
+                    ),
+                    on_trace=lambda meta: (
+                        trace_placeholder.caption(
+                            f"[View trace]({meta['trace_url']})"
+                        )
+                        if meta.get("trace_url")
+                        else None
                     ),
                 )
             if full_response.startswith("[error]"):
@@ -581,8 +690,18 @@ def chat_interface():
             )
 
         message_placeholder.markdown(full_response.rstrip("\n"))
+        if trace_meta and trace_meta.get("trace_url"):
+            trace_placeholder.caption(f"[View trace]({trace_meta['trace_url']})")
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+    st.session_state.messages.append(
+        {
+            "id": (trace_meta or {}).get("message_id"),
+            "role": "assistant",
+            "content": full_response,
+            "trace_id": (trace_meta or {}).get("trace_id"),
+            "trace_url": (trace_meta or {}).get("trace_url"),
+        }
+    )
     st.session_state.sessions_list = fetch_sessions()
     if "[APPROVAL REQUIRED]" in full_response:
         st.session_state.approval_requested = True
