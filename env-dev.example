@@ -20,6 +20,17 @@ DATABASE_URL=postgresql://postgres:@localhost:5432/sessions
 # DB_HOST=localhost
 # DB_PORT=5432
 
+# UI → API (Streamlit). Prefer full URL in prod:
+# FASTAPI_BASE_URL=https://villa-assistant-api.onrender.com
+# Local default is http://127.0.0.1:9005 via:
+# FASTAPI_HOST=127.0.0.1
+# FASTAPI_PORT=9005
+
+# Render / cloud listen port (set automatically on Render as PORT)
+# PORT=9005
+# CORS_ALLOW_ALL=true
+# CORS_ORIGINS=https://your-app.streamlit.app
+
 # Default admin seeded by: python -m db.init_db (from Agent/)
 DEFAULT_ADMIN_USERNAME=admin
 DEFAULT_ADMIN_PASSWORD=admin

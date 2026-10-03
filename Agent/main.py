@@ -70,12 +70,20 @@ from psycopg_pool import AsyncConnectionPool
 # langchain.verbose = True
 load_dotenv()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-origins = [
-
+_default_origins = [
     "http://localhost",
     "http://localhost:8080",
-    "http://localhost:3000/"
+    "http://localhost:3000",
+    "http://localhost:8501",
 ]
+_extra_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "").split(",")
+    if o.strip()
+]
+origins = _default_origins + _extra_origins
+# Streamlit Cloud / demos: allow all when CORS_ALLOW_ALL=true
+_cors_allow_all = os.getenv("CORS_ALLOW_ALL", "").lower() in ("1", "true", "yes")
 
 # Free-tier chain: Gemini -> Groq -> Grok -> OpenRouter -> Cerebras (keys optional).
 _provider_models = get_provider_models()
@@ -270,8 +278,8 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"] if _cors_allow_all else origins,
+    allow_credentials=not _cors_allow_all,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -285,7 +293,13 @@ def _get_router_graph():
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello from the local FastAPI server!"}
+    return {"message": "Villa assistant API", "status": "ok"}
+
+
+@app.get("/health")
+def health():
+    """Liveness probe for Render and other hosts."""
+    return {"status": "ok"}
 
 
 
@@ -1052,7 +1066,8 @@ async def approve_pending_email(
 
 
 if __name__ == "__main__":
-    run_kwargs: dict = {"host": "0.0.0.0", "port": 9005}
+    port = int(os.getenv("PORT") or os.getenv("FASTAPI_PORT", "9005"))
+    run_kwargs: dict = {"host": "0.0.0.0", "port": port}
     if sys.platform == "win32":
         # uvicorn's default asyncio factory is ProactorEventLoop on Windows.
         run_kwargs["loop"] = "asyncio:SelectorEventLoop"

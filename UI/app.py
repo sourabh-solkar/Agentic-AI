@@ -20,9 +20,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-_FASTAPI_HOST = os.getenv("FASTAPI_HOST", "127.0.0.1")
-_FASTAPI_PORT = int(os.getenv("FASTAPI_PORT", "9005"))
-_FASTAPI_BASE_URL = f"http://{_FASTAPI_HOST}:{_FASTAPI_PORT}"
+# Streamlit Cloud injects secrets via st.secrets; mirror into env for local parity.
+try:
+    for _key in ("FASTAPI_BASE_URL", "FASTAPI_HOST", "FASTAPI_PORT"):
+        if not os.getenv(_key) and _key in st.secrets:
+            os.environ[_key] = str(st.secrets[_key])
+except Exception:
+    pass
+
+
+def _resolve_fastapi_base_url() -> str:
+    """Prefer FASTAPI_BASE_URL (https://api.example.com). Fall back to host:port."""
+    explicit = (os.getenv("FASTAPI_BASE_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    host = os.getenv("FASTAPI_HOST", "127.0.0.1")
+    port = os.getenv("FASTAPI_PORT", "9005")
+    if host in ("127.0.0.1", "localhost"):
+        return f"http://{host}:{port}"
+    # Public hostname (Render, etc.): HTTPS on 443, no custom port.
+    return f"https://{host}"
+
+
+_FASTAPI_BASE_URL = _resolve_fastapi_base_url()
 FASTAPI_CHAT_URL = f"{_FASTAPI_BASE_URL}/chat"
 FASTAPI_LOGIN_URL = f"{_FASTAPI_BASE_URL}/login"
 FASTAPI_REGISTER_URL = f"{_FASTAPI_BASE_URL}/register"
@@ -1337,8 +1357,8 @@ def chat_interface():
             run_status.update(label="Request failed", state="error")
             full_response = (
                 f"Could not reach `{FASTAPI_CHAT_URL}`. "
-                f"Start the API (`Agent/main.py`) and ensure FASTAPI_PORT matches uvicorn "
-                f"(default **{_FASTAPI_PORT}**). Reason: {e.reason}"
+                f"Start the API (`Agent/main.py`) and set `FASTAPI_BASE_URL` "
+                f"(or FASTAPI_HOST / FASTAPI_PORT). Reason: {e.reason}"
             )
 
         message_placeholder.markdown(full_response.rstrip("\n"))

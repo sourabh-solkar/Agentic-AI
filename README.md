@@ -48,6 +48,7 @@ python server.py
 
 - [SSE streaming (UI + backend)](docs/SSE_STREAMING.md) — how live graph status and final answers are streamed over SSE, including the Python 3.10 `interrupt()` workaround.
 - [Token-based credit billing](docs/CREDITS_BILLING.md) — hold → meter → settle credits from provider token usage per chat/approval turn.
+- [Free deploy (Neon + Render + Streamlit)](docs/DEPLOY_FREE.md) — public demo hosting checklist.
 
 ## Dependencies
 

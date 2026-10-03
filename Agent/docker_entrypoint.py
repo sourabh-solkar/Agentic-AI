@@ -17,7 +17,8 @@ def main() -> None:
         )
         sys.exit(1)
 
-    port = os.getenv("FASTAPI_PORT", "9005")
+    # Render/Cloud Run inject PORT; local Docker uses FASTAPI_PORT.
+    port = os.getenv("PORT") or os.getenv("FASTAPI_PORT", "9005")
     os.execvp(
         "uvicorn",
         ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", port],
